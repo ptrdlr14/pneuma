@@ -1,0 +1,37 @@
+# 官方 ACT Aloha 仿真；启动时用 --model.repo_or_path 指定已下载的本地 checkpoint。
+deployment = "manipulation"
+semantics = "aloha-sim-14d-v1"
+
+[model]
+policy = "act"
+repo_or_path = "/absolute/path/to/act_aloha_sim_transfer_cube_human"
+device = "auto"
+
+[execution]
+supported_modes = ["chunk"]
+action_fps = 50.0
+warmup_calls = 2
+# prediction_steps 与默认 n_action_steps 从 checkpoint config.json 读取。
+
+[zenoh]
+mode = "peer"
+listen_endpoints = ["tcp/127.0.0.1:7447"]
+
+[[features]]
+name = "observation.state"
+shape = [14]
+dtype = "float32"
+semantics = "aloha-sim-14d-v1"
+
+[[features]]
+name = "observation.images.top"
+shape = [480, 640, 3]
+dtype = "uint8"
+kind = "rgb"
+semantics = "rgb-top-table-v1"
+
+[action_feature]
+name = "action"
+shape = [14]
+dtype = "float32"
+semantics = "aloha-sim-14d-v1"

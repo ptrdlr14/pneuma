@@ -1,0 +1,39 @@
+# SO-101 协议冒烟：echo 返回全零动作，仅用于无动作联调。
+deployment = "manipulation"
+semantics = "so101-degrees-gripper-percent-v1"
+
+[model]
+policy = "echo"
+device = "auto"
+
+[execution]
+supported_modes = ["chunk"]
+action_fps = 30.0
+prediction_steps = 50
+n_action_steps = 16
+warmup_calls = 2
+
+[zenoh]
+mode = "peer"
+listen_endpoints = ["tcp/127.0.0.1:7447"]
+
+[[features]]
+name = "observation.state"
+shape = [6]
+dtype = "float32"
+names = ["shoulder_pan.pos", "shoulder_lift.pos", "elbow_flex.pos", "wrist_flex.pos", "wrist_roll.pos", "gripper.pos"]
+semantics = "so101-degrees-gripper-percent-v1"
+
+[[features]]
+name = "observation.images.front"
+shape = [480, 640, 3]
+dtype = "uint8"
+kind = "rgb"
+semantics = "rgb-front-table-v1"
+
+[action_feature]
+name = "action"
+shape = [6]
+dtype = "float32"
+names = ["shoulder_pan.pos", "shoulder_lift.pos", "elbow_flex.pos", "wrist_flex.pos", "wrist_roll.pos", "gripper.pos"]
+semantics = "so101-degrees-gripper-percent-v1"

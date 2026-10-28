@@ -1,0 +1,14 @@
+# Rust 构建产物（本机也可能是指向缓存的符号链接）
+/target
+
+# Python 本地环境和字节码缓存
+/.venv/
+__pycache__/
+*.py[cod]
+
+# 本地工具设置和系统文件
+/.cluade/
+.DS_Store
+
+# 由 scripts/dump_act_reference.py 生成的模型对齐数据
+/scripts/fixtures/parity/
