@@ -8,7 +8,11 @@ __pycache__/
 
 # 本地工具设置和系统文件
 /.cluade/
+/.desloppify/
 .DS_Store
 
 # 由 scripts/dump_act_reference.py 生成的模型对齐数据
 /scripts/fixtures/parity/
+
+# 仿真评测结果和服务日志
+/outputs/

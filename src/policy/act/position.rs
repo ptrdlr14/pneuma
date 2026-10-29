@@ -1,5 +1,5 @@
-//! ACTSinusoidalPositionEmbedding2d 的等价纯函数实现（无参数模块）。
-//! 逐式对齐 modeling_act.py：位置索引从 1 起、除以 (max+eps) 归一到 [0,2π]、
+//! `ACTSinusoidalPositionEmbedding2d` 的等价纯函数实现（无参数模块）。
+//! 逐式对齐 `modeling_act.py`：位置索引从 1 起、除以 (max+eps) 归一到 [0,2π]、
 //! 频率按 10000^(2*(j//2)/dimension)，x/y 各产生 interleave 的 sin/cos，y 在前。
 
 use burn::tensor::{Device, Tensor};
@@ -55,10 +55,6 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/scripts/fixtures/pos2d_small.json"
         );
-        if !std::path::Path::new(path).exists() {
-            eprintln!("跳过：缺少 fixtures（先运行 scripts/dump_act_reference.py）");
-            return;
-        }
         let want: Vec<f32> = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         assert_eq!(got.len(), want.len());
         for (i, (g, w)) in got.iter().zip(&want).enumerate() {

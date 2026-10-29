@@ -1,6 +1,6 @@
-//! 有界 MessagePack 编解码：信封收发与显式类型的 tensor/RGB 记录。
+//! 有界 `MessagePack` 编解码：信封收发与显式类型的 tensor/RGB 记录。
 //! 对齐 lerobot `remote_inference/codec.py`：拒绝扩展类型、非有限浮点、
-//! 重复 map 键，所有分配先过预算；JPEG 仅 RGB 记录可选，tensor 永远是 raw。
+//! 重复 map 键，所有分配先过预算；tensor/RGB 记录当前均仅支持 raw。
 
 use std::io::Cursor;
 
@@ -164,7 +164,7 @@ pub struct TensorRecord<'a> {
     pub dtype: String,
     pub shape: Vec<u64>,
     pub data: &'a [u8],
-    /// rgb 记录附带 channel_order 校验后的标记，骨架只支持 raw。
+    /// rgb 记录附带 `channel_order` 校验后的标记，骨架只支持 raw。
     pub rgb: bool,
 }
 
@@ -176,10 +176,21 @@ pub fn decode_record(value: &Value) -> Result<TensorRecord<'_>, ProtocolError> {
     let dtype = body_get(value, "dtype")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let shape: Vec<u64> = body_get(value, "shape")
+    let dims = body_get(value, "shape")
         .and_then(Value::as_array)
-        .map(|dims| dims.iter().filter_map(|d| d.as_u64()).collect())
-        .unwrap_or_default();
+        .ok_or_else(|| ProtocolError::new(ErrorCode::Malformed, "shape must be an array"))?;
+    let shape = dims
+        .iter()
+        .enumerate()
+        .map(|(index, dimension)| {
+            dimension.as_u64().ok_or_else(|| {
+                ProtocolError::new(
+                    ErrorCode::Malformed,
+                    format!("shape[{index}] must be a non-negative integer"),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let data = body_get(value, "data")
         .and_then(|d| d.as_slice())
         .unwrap_or(&[]);
@@ -421,5 +432,36 @@ mod tests {
         )]);
         let error = validate_features(&nan, &specs()).unwrap_err();
         assert_eq!(error.code, ErrorCode::Malformed);
+    }
+}
+
+#[cfg(test)]
+mod shape_regression_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_shape_is_never_silently_reduced() {
+        for (shape, data, diagnostic) in [
+            (
+                Some(Value::Array(vec![6.into(), (-1).into()])),
+                vec![0; 24],
+                "shape[1]",
+            ),
+            (Some(true.into()), vec![0; 4], "shape"),
+            (None, vec![0; 4], "shape"),
+        ] {
+            let mut record = tensor_record("float32", &[], data);
+            let Value::Map(entries) = &mut record else {
+                panic!("expected map")
+            };
+            entries.retain(|(key, _)| key.as_str() != Some("shape"));
+            if let Some(shape) = shape {
+                entries.push(("shape".into(), shape));
+            }
+            let error = decode_record(&record).unwrap_err();
+            assert_eq!(error.code, ErrorCode::Malformed);
+            assert!(error.message.contains(diagnostic), "{error}");
+        }
+        assert!(decode_record(&tensor_record("float32", &[], vec![0; 4])).is_ok());
     }
 }

@@ -1,13 +1,13 @@
 //! ACT 的 encoder/decoder：post-norm（pre_norm=false 已在 config 层把关），
-//! torch MultiheadAttention 的 in_proj 融合权重按 q|k|v 行切分等价还原。
+//! torch `MultiheadAttention` 的 `in_proj` 融合权重按 q|k|v 行切分等价还原。
 //! 布局统一 (B, S, D)；dropout 在推理下为恒等，不建模。
 
 use burn::module::Module;
 use burn::nn::{Linear, LinearConfig};
 use burn::tensor::activation::{relu, softmax};
-use burn::tensor::{Device, Tensor, TensorData};
+use burn::tensor::{Device, Tensor, TensorData, s};
 
-/// torch LayerNorm（biased variance，eps=1e-5），weight/bias 键名直接对齐 state_dict。
+/// torch `LayerNorm`（biased variance，eps=1e-5），weight/bias 键名直接对齐 `state_dict`。
 #[derive(Module, Debug)]
 pub struct LayerNorm {
     pub weight: burn::module::Param<burn::tensor::Tensor<1>>,
@@ -36,10 +36,10 @@ impl LayerNorm {
     }
 }
 
-/// nn.MultiheadAttention：in_proj_weight [3D, D] 单 Linear 等价；query/key/value 分源投影。
+/// nn.MultiheadAttention：`in_proj_weight` [3D, D] 单 Linear 等价；query/key/value 分源投影。
 #[derive(Module, Debug)]
 pub struct MultiheadAttention {
-    /// in_proj 键名带下划线（in_proj_weight），字段用点段路径 + 加载时重映射。
+    /// `in_proj` 键名带下划线（`in_proj_weight`），字段用点段路径 + 加载时重映射。
     pub in_proj: Linear,
     pub out_proj: Linear,
     #[module(skip)]
@@ -64,12 +64,8 @@ impl MultiheadAttention {
 
     pub fn forward(&self, query: Tensor<3>, key: Tensor<3>, value: Tensor<3>) -> Tensor<3> {
         let dim = query.dims()[2];
-        use burn::tensor::s;
         let q = self.in_proj.forward(query).slice(s![.., .., 0..dim]);
-        let k = self
-            .in_proj
-            .forward(key.clone())
-            .slice(s![.., .., dim..2 * dim]);
+        let k = self.in_proj.forward(key).slice(s![.., .., dim..2 * dim]);
         let v = self
             .in_proj
             .forward(value)
@@ -89,7 +85,7 @@ impl MultiheadAttention {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct EncoderLayerConfig {
+pub struct TransformerLayerConfig {
     pub dim_model: usize,
     pub n_heads: usize,
     pub dim_feedforward: usize,
@@ -104,8 +100,8 @@ pub struct ACTEncoderLayer {
     pub norm2: LayerNorm,
 }
 
-impl EncoderLayerConfig {
-    pub fn init(&self, device: &Device) -> ACTEncoderLayer {
+impl TransformerLayerConfig {
+    pub fn init_encoder_layer(&self, device: &Device) -> ACTEncoderLayer {
         ACTEncoderLayer {
             self_attn: MultiheadAttention::init(self.dim_model, self.n_heads, device),
             linear1: LinearConfig::new(self.dim_model, self.dim_feedforward).init(device),
@@ -151,7 +147,7 @@ pub struct ACTDecoderLayer {
     pub norm3: LayerNorm,
 }
 
-impl EncoderLayerConfig {
+impl TransformerLayerConfig {
     pub fn init_decoder_layer(&self, device: &Device) -> ACTDecoderLayer {
         ACTDecoderLayer {
             self_attn: MultiheadAttention::init(self.dim_model, self.n_heads, device),
@@ -166,7 +162,7 @@ impl EncoderLayerConfig {
 }
 
 impl ACTDecoderLayer {
-    /// x/dec_pos (B,DS,D)；enc/enc_pos (B,ES,D)。对齐 python decoder 三层残差。
+    /// `x`/`dec_pos` (B,DS,D)；`enc`/`enc_pos` (B,ES,D)。对齐 python decoder 三层残差。
     pub fn forward(
         &self,
         x: Tensor<3>,
@@ -205,7 +201,7 @@ impl ACTDecoder {
         &self,
         x: Tensor<3>,
         dec_pos: &Tensor<3>,
-        enc: Tensor<3>,
+        enc: &Tensor<3>,
         enc_pos: &Tensor<3>,
     ) -> Tensor<3> {
         let x = self
@@ -213,5 +209,73 @@ impl ACTDecoder {
             .iter()
             .fold(x, |acc, l| l.forward(acc, dec_pos, enc.clone(), enc_pos));
         self.norm.forward(x)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::module::Param;
+
+    #[test]
+    fn layer_norm_uses_population_variance_and_affine_parameters() {
+        let device = Device::flex();
+        let norm = LayerNorm {
+            weight: Param::from_data(TensorData::new(vec![2.0f32, 3.0], [2]), &device),
+            bias: Param::from_data(TensorData::new(vec![0.5f32, -0.5], [2]), &device),
+        };
+        let input = Tensor::from_data([[[1.0f32, 3.0], [7.0, 7.0]]], &device);
+        let got = norm.forward(input).into_data().try_to_vec::<f32>().unwrap();
+        let scale = 1.0 / (1.0f32 + 1e-5).sqrt();
+        let expected = [0.5 - 2.0 * scale, -0.5 + 3.0 * scale, 0.5, -0.5];
+        for (actual, expected) in got.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-6, "{got:?}");
+        }
+    }
+
+    #[test]
+    fn attention_projects_distinct_sources_and_merges_scaled_heads() {
+        let device = Device::flex();
+        // 三组单位投影让手算结果只取决于分头、缩放、softmax 和 value 来源。
+        let mut projection = vec![0.0f32; 4 * 12];
+        for row in 0..4 {
+            for block in 0..3 {
+                projection[row * 12 + block * 4 + row] = 1.0;
+            }
+        }
+        let attention = MultiheadAttention {
+            in_proj: Linear {
+                weight: Param::from_data(TensorData::new(projection, [4, 12]), &device),
+                bias: None,
+            },
+            out_proj: Linear {
+                weight: Param::from_data(
+                    TensorData::new(
+                        vec![
+                            1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+                            0.0, 0.0, 1.0,
+                        ],
+                        [4, 4],
+                    ),
+                    &device,
+                ),
+                bias: None,
+            },
+            n_heads: 2,
+        };
+        let query = Tensor::from_data([[[1.0f32, 0.0, 0.0, 1.0]]], &device);
+        let key = Tensor::from_data([[[1.0f32, 0.0, 1.0, 0.0], [0.0, 1.0, 0.0, 1.0]]], &device);
+        let value = Tensor::from_data(
+            [[[2.0f32, 4.0, 6.0, 8.0], [10.0, 12.0, 14.0, 16.0]]],
+            &device,
+        );
+        let output = attention.forward(query, key, value);
+        assert_eq!(output.dims(), [1, 1, 4]);
+        let got = output.into_data().try_to_vec::<f32>().unwrap();
+        let p = 1.0 / (1.0 + (-1.0f32 / 2.0f32.sqrt()).exp());
+        let expected = [10.0 - 8.0 * p, 12.0 - 8.0 * p, 6.0 + 8.0 * p, 8.0 + 8.0 * p];
+        for (actual, expected) in got.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-5, "{got:?}");
+        }
     }
 }

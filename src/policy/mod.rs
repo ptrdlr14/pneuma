@@ -6,11 +6,10 @@ pub mod act;
 
 use rmpv::Value;
 
-use crate::codec;
 use crate::config::ServerConfig;
 use crate::protocol::{Capabilities, ProtocolError};
 
-/// 一次推理的产物：canonical 动作块按 execution_steps×action_dim 行主序平铺。
+/// 一次推理的产物：canonical 动作块按 `execution_steps × action_dim` 行主序平铺。
 pub struct Chunk {
     pub canonical_actions: Vec<u8>,
     pub execution_steps: u64,
@@ -26,14 +25,29 @@ pub trait PolicyRunner: Send + Sync {
 }
 
 /// 全零动作桩；不读观测内容，只验证特征键已由 server 校验过。
-pub struct EchoPolicy;
+pub struct ZeroActionPolicy;
 
-impl PolicyRunner for EchoPolicy {
+impl PolicyRunner for ZeroActionPolicy {
     fn predict(&self, caps: &Capabilities, _features: &Value) -> Result<Chunk, ProtocolError> {
-        let dim = caps.action_feature.shape[0] as usize;
-        let zeros = vec![0f32; caps.execution_steps as usize * dim];
+        let invalid_size = || {
+            ProtocolError::new(
+                crate::protocol::ErrorCode::Execution,
+                "Action size exceeds capacity",
+            )
+        };
+        let bytes = caps
+            .execution_steps
+            .checked_mul(caps.action_feature.shape[0])
+            .and_then(|elements| elements.checked_mul(4))
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .ok_or_else(invalid_size)?;
+        let mut canonical_actions = Vec::new();
+        canonical_actions
+            .try_reserve_exact(bytes)
+            .map_err(|_| invalid_size())?;
+        canonical_actions.resize(bytes, 0);
         Ok(Chunk {
-            canonical_actions: codec::f32_le(&zeros),
+            canonical_actions,
             execution_steps: caps.execution_steps,
         })
     }
@@ -56,9 +70,14 @@ pub fn build(
                     .execution
                     .prediction_steps
                     .ok_or_else(|| anyhow::anyhow!("echo requires execution.prediction_steps"))?;
-                (std::sync::Arc::new(EchoPolicy), prediction, prediction)
+                (
+                    std::sync::Arc::new(ZeroActionPolicy),
+                    prediction,
+                    prediction,
+                )
             }
             Policy::Act => {
+                act::validate_contract(&cfg.features, &cfg.action_feature)?;
                 let policy = act::ActPolicy::load_configured(
                     &cfg.model.repo_or_path,
                     cfg.model.device,
@@ -76,4 +95,34 @@ pub fn build(
     let caps = cfg.capabilities(prediction_steps, execution_steps);
     policy.validate_against(&caps)?;
     Ok((policy, caps))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn echo_rejects_overflowing_action_size() {
+        let cfg = ServerConfig::load(std::path::Path::new("examples/so101.toml")).unwrap();
+        let (_, mut caps) = build(&cfg).unwrap();
+        caps.execution_steps = u64::MAX;
+        let error = ZeroActionPolicy
+            .predict(&caps, &crate::protocol::map([]))
+            .err()
+            .expect("overflow must return an execution error");
+        assert_eq!(error.code, crate::protocol::ErrorCode::Execution);
+    }
+
+    #[test]
+    fn echo_produces_advertised_zero_actions() {
+        let cfg = ServerConfig::load(std::path::Path::new("examples/so101.toml")).unwrap();
+        let (policy, caps) = build(&cfg).unwrap();
+        let chunk = policy.predict(&caps, &crate::protocol::map([])).unwrap();
+        assert_eq!(chunk.execution_steps, caps.execution_steps);
+        assert_eq!(
+            chunk.canonical_actions.len() as u64,
+            caps.execution_steps * caps.action_feature.shape[0] * 4
+        );
+        assert!(chunk.canonical_actions.iter().all(|v| *v == 0));
+    }
 }

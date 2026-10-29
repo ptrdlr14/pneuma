@@ -37,29 +37,31 @@ pub struct ActConfig {
 const SUPPORTED_BACKBONE: &str = "resnet18";
 
 pub fn parse(path: &std::path::Path) -> anyhow::Result<ActConfig> {
-    use anyhow::{Context, anyhow};
-    let at = || path.display().to_string();
+    use anyhow::Context;
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading ACT config {}", path.display()))?;
     let hf: HfActConfig = serde_json::from_str(&raw)
         .with_context(|| format!("parsing ACT config {}", path.display()))?;
+    validate(&hf).with_context(|| format!("validating ACT config {}", path.display()))
+}
+
+fn validate(hf: &HfActConfig) -> anyhow::Result<ActConfig> {
+    use anyhow::anyhow;
     if hf.vision_backbone != SUPPORTED_BACKBONE {
         return Err(anyhow!(
-            "{}: vision_backbone={} 未移植",
-            at(),
+            "ACT config: vision_backbone={} 未移植",
             hf.vision_backbone
         ));
     }
     if hf.replace_final_stride_with_dilation {
-        return Err(anyhow!("{}: 膨胀卷积变体未移植", at()));
+        return Err(anyhow!("ACT config: 膨胀卷积变体未移植"));
     }
     if hf.pre_norm {
-        return Err(anyhow!("{}: pre_norm 未移植", at()));
+        return Err(anyhow!("ACT config: pre_norm 未移植"));
     }
     if hf.feedforward_activation != "relu" {
         return Err(anyhow!(
-            "{}: activation={}",
-            at(),
+            "ACT config: activation={}",
             hf.feedforward_activation
         ));
     }
@@ -70,6 +72,24 @@ pub fn parse(path: &std::path::Path) -> anyhow::Result<ActConfig> {
     anyhow::ensure!(
         hf.chunk_size > 0 && hf.n_action_steps > 0 && hf.n_action_steps <= hf.chunk_size,
         "checkpoint n_action_steps must be in 1..=chunk_size"
+    );
+    for (name, value) in [
+        ("dim_model", hf.dim_model),
+        ("n_heads", hf.n_heads),
+        ("dim_feedforward", hf.dim_feedforward),
+        ("n_encoder_layers", hf.n_encoder_layers),
+        ("n_decoder_layers", hf.n_decoder_layers),
+        ("latent_dim", hf.latent_dim),
+    ] {
+        anyhow::ensure!(value > 0, "checkpoint {name} must be positive");
+    }
+    anyhow::ensure!(
+        hf.dim_model.is_multiple_of(hf.n_heads),
+        "checkpoint dim_model must be divisible by n_heads"
+    );
+    anyhow::ensure!(
+        hf.dim_model.is_multiple_of(4),
+        "checkpoint dim_model must be divisible by 4 for paired x/y sinusoidal positions"
     );
     let _ = hf.pretrained_backbone_weights;
     Ok(ActConfig {
@@ -82,4 +102,43 @@ pub fn parse(path: &std::path::Path) -> anyhow::Result<ActConfig> {
         n_decoder_layers: hf.n_decoder_layers,
         latent_dim: hf.latent_dim,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn metadata() -> serde_json::Value {
+        serde_json::json!({
+            "chunk_size": 4, "n_action_steps": 2, "dim_model": 8,
+            "n_heads": 2, "dim_feedforward": 16, "feedforward_activation": "relu",
+            "n_encoder_layers": 1, "n_decoder_layers": 1, "vision_backbone": "resnet18",
+            "pretrained_backbone_weights": null, "replace_final_stride_with_dilation": false,
+            "pre_norm": false, "use_vae": true, "latent_dim": 2
+        })
+    }
+
+    #[test]
+    fn invalid_numeric_metadata_is_rejected_before_model_construction() {
+        assert!(validate(&serde_json::from_value(metadata()).unwrap()).is_ok());
+        for field in [
+            "dim_model",
+            "n_heads",
+            "dim_feedforward",
+            "n_encoder_layers",
+            "n_decoder_layers",
+            "latent_dim",
+        ] {
+            let mut value = metadata();
+            value[field] = 0.into();
+            let error = validate(&serde_json::from_value(value).unwrap()).unwrap_err();
+            assert!(error.to_string().contains(field), "{field}: {error}");
+        }
+        for (dim, heads) in [(8, 3), (9, 3)] {
+            let mut value = metadata();
+            value["dim_model"] = dim.into();
+            value["n_heads"] = heads.into();
+            assert!(validate(&serde_json::from_value(value).unwrap()).is_err());
+        }
+    }
 }

@@ -1,4 +1,4 @@
-# 官方 ACT Aloha 仿真；启动时用 --model.repo_or_path 指定已下载的本地 checkpoint。
+# 官方 ACT Aloha 仿真；启动时用 --checkpoint 指定已下载的本地 checkpoint。
 deployment = "manipulation"
 semantics = "aloha-sim-14d-v1"
 

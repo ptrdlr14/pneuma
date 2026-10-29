@@ -76,9 +76,11 @@ def _python_encoder_inputs(model, batch):
     return torch.stack(tokens, 0), torch.stack(pos, 0)
 
 
-def dump_parity_dir() -> None:
-    ckpt = checkpoint_dir()
+def load_reference_policy(ckpt: str):
+    """与数值对齐和仿真共用的官方 ACT 加载路径，设备固定为 CPU。"""
     config = ACTConfig.from_pretrained(ckpt)
+    config.device = "cpu"
+    config.pretrained_backbone_weights = None
     policy = ACTPolicy(config)
     policy.eval()
 
@@ -87,17 +89,17 @@ def dump_parity_dir() -> None:
     missing, unexpected = policy.model.load_state_dict(stripped, strict=True)
     print(f"权重加载: {len(stripped)} 个键, missing={len(missing)}, unexpected={len(unexpected)}")
 
+    return policy, raw
+
+
+def predict_reference(policy, raw, state, image):
+    """原始观测 → checkpoint 归一化 → 官方前向 → canonical 动作。"""
     img_mean = raw["normalize_inputs.buffer_observation_images_top.mean"]  # (3,1,1)
     img_std = raw["normalize_inputs.buffer_observation_images_top.std"]
     s_mean = raw["normalize_inputs.buffer_observation_state.mean"]  # (14,)
     s_std = raw["normalize_inputs.buffer_observation_state.std"]
     a_mean = raw["unnormalize_outputs.buffer_action.mean"]  # (14,)
     a_std = raw["unnormalize_outputs.buffer_action.std"]
-
-    # 确定性伪随机观测（seed=0），Rust parity 测试读同一份二进制。
-    rng = np.random.default_rng(0)
-    state = rng.uniform(-1.0, 1.0, 14).astype(np.float32)
-    image = rng.integers(0, 256, (480, 640, 3), dtype=np.uint8)
 
     # 官方 policy_runner._batch + Normalize 的等价式。
     image_n = (torch.from_numpy(image).permute(2, 0, 1).float() / 255.0 - img_mean) / img_std
@@ -109,6 +111,17 @@ def dump_parity_dir() -> None:
     with torch.no_grad():
         chunk = policy.predict_action_chunk(batch)  # (1, chunk_size, 14) 归一化
     actions = chunk * a_std + a_mean  # Unnormalize 等价
+    return actions, batch
+
+
+def dump_parity_dir() -> None:
+    policy, raw = load_reference_policy(checkpoint_dir())
+    config = policy.config
+    # 确定性伪随机观测（seed=0），Rust parity 测试读同一份二进制。
+    rng = np.random.default_rng(0)
+    state = rng.uniform(-1.0, 1.0, 14).astype(np.float32)
+    image = rng.integers(0, 256, (480, 640, 3), dtype=np.uint8)
+    actions, batch = predict_reference(policy, raw, state, image)
 
     # 二分定位用的中间值（Rust debug 测试逐段比对）。
     model = policy.model

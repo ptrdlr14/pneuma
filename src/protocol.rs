@@ -1,13 +1,13 @@
 //! 线协议 v1 的寻址、信封与描述符契约。
 //! 对齐 lerobot `remote_inference/protocol.py` 与 `inference/contracts.py`，
-//! 消息类型为 snake_case 的线格式字符串，与 Python StrEnum 逐字一致。
+//! 消息类型为 `snake_case` 的线格式字符串，与 Python `StrEnum` 逐字一致。
 
 use rmpv::Value;
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// 观测/动作体内必须原样回带的关联身份键（对齐 Python IDENTITY_KEYS）。
+/// 观测/动作体内必须原样回带的关联身份键（对齐 Python `IDENTITY_KEYS`）。
 pub const IDENTITY_KEYS: [&str; 5] = [
     "artifact_identity",
     "observation_id",
@@ -279,12 +279,12 @@ pub struct Capabilities {
     pub current_observation_only: bool,
     pub retains_session_state: bool,
     pub action_representation: String,
-    /// model_action_dim 与 action 维一致或缺省时省略（与 Python 弹出逻辑一致）。
+    /// `model_action_dim` 与 action 维一致或缺省时省略（与 Python 弹出逻辑一致）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_action_dim: Option<u64>,
 }
 
-/// 在 MessagePack map 中查找第一个匹配的字符串键。
+/// 在 `MessagePack` map 中查找第一个匹配的字符串键。
 pub(crate) fn body_get<'a>(body: &'a Value, key: &str) -> Option<&'a Value> {
     body.as_map()?
         .iter()
@@ -299,4 +299,62 @@ pub fn map<const N: usize>(entries: [(&str, Value); N]) -> Value {
             .map(|(k, v)| (Value::String(k.into()), v))
             .collect(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discovery_allows_empty_identity_but_session_messages_require_correlation() {
+        let mut envelope = Envelope {
+            version: PROTOCOL_VERSION,
+            message_type: MessageType::Describe,
+            instance_id: String::new(),
+            session_id: String::new(),
+            generation: 0,
+            request_id: String::new(),
+            body: map([]),
+        };
+        assert!(envelope.validate().is_ok());
+        for kind in [
+            MessageType::Control,
+            MessageType::Observation,
+            MessageType::LanguageRequest,
+        ] {
+            envelope.message_type = kind;
+            assert_eq!(
+                envelope.validate().unwrap_err().code,
+                ErrorCode::Malformed,
+                "{kind:?}"
+            );
+        }
+        envelope.instance_id = "inst1".into();
+        envelope.session_id = "sess1".into();
+        envelope.request_id = "req1".into();
+        assert!(envelope.validate().is_ok());
+        let reply = envelope.error(ErrorCode::Stale, "generation differs");
+        assert_eq!(reply.instance_id, envelope.instance_id);
+        assert_eq!(reply.session_id, envelope.session_id);
+        assert_eq!(reply.request_id, envelope.request_id);
+        assert_eq!(reply.generation, envelope.generation);
+        assert_eq!(reply.message_type, MessageType::Error);
+    }
+
+    #[test]
+    fn addressing_rejects_cross_deployment_segments() {
+        assert_eq!(
+            session_prefix("robot", "inst1", "sess1").unwrap(),
+            "lerobot/inference/v1/deployments/robot/instances/inst1/sessions/sess1"
+        );
+        for segment in ["", "../robot", "robot/other", "robot*", " robot"] {
+            assert_eq!(
+                deployment_prefix(segment).unwrap_err().code,
+                ErrorCode::Malformed,
+                "{segment:?}"
+            );
+            assert!(instance_prefix("robot", segment).is_err());
+            assert!(session_prefix("robot", "inst1", segment).is_err());
+        }
+    }
 }
