@@ -12,6 +12,7 @@ use crate::protocol::{Capabilities, FeatureSpec, deployment_prefix};
 pub enum Policy {
     Echo,
     Act,
+    Smolvla,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
@@ -31,6 +32,9 @@ pub struct ModelConfig {
     pub repo_or_path: PathBuf,
     #[serde(default)]
     pub device: Device,
+    /// SmolVLA 的本地 VLM config.json 与 tokenizer 资源目录；默认使用 checkpoint/vlm。
+    #[serde(default)]
+    pub vlm_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,7 +45,7 @@ pub struct ExecutionConfig {
     pub action_deadline_s: f64,
     pub idle_timeout_s: f64,
     pub warmup_calls: usize,
-    /// ACT 默认从 checkpoint 读取；echo 必须显式给出预测步数。
+    /// 模型策略从 checkpoint 读取；echo 必须显式给出预测步数。
     pub prediction_steps: Option<u64>,
     pub n_action_steps: Option<u64>,
 }
@@ -80,7 +84,7 @@ pub struct ServerConfig {
     pub zenoh: ZenohConfig,
     pub features: Vec<FeatureSpec>,
     pub action_feature: FeatureSpec,
-    /// echo 的固定身份；ACT 未指定时由本地 checkpoint 路径派生。
+    /// echo 的固定身份；模型策略未指定时由策略名与本地 checkpoint 路径派生。
     #[serde(default)]
     pub artifact_identity: Option<String>,
 }
@@ -143,14 +147,14 @@ impl ServerConfig {
                 execution.prediction_steps.is_some(),
                 "echo requires execution.prediction_steps"
             ),
-            Policy::Act => {
+            Policy::Act | Policy::Smolvla => {
                 ensure!(
                     !self.model.repo_or_path.as_os_str().is_empty(),
-                    "act requires model.repo_or_path"
+                    "model policy requires model.repo_or_path"
                 );
                 ensure!(
                     execution.prediction_steps.is_none(),
-                    "ACT prediction_steps comes from checkpoint; use execution.n_action_steps to limit execution"
+                    "prediction_steps comes from checkpoint; use execution.n_action_steps to limit execution"
                 );
             }
         }

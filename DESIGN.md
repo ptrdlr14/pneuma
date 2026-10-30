@@ -52,7 +52,7 @@ ACTION 的 `server_durations.queue` 从回调接收时刻计到 worker 内 predi
 
 部署配置负责通用 schema、semantics、执行和网络约束；ACT 支持的固定 state/image/action 特征由 ACT 模块的纯校验函数维护，策略构建在读取 checkpoint 和预热之前校验，并在最终通告合约上复用。checkpoint 数值不变量在构造模块前校验，归一化缓冲在预热前校验；不合法输入返回启动错误。
 
-`model.policy=echo|act` 选择实现，`model.repo_or_path` 为本地 checkpoint 目录；`model.device=auto|flex|metal` 显式选择 Burn 后端。ACT 的预测/执行步数默认取 checkpoint，`execution.n_action_steps` 可限制执行片段；echo 的步数在示例中显式声明。配置中不支持的字段或取值在启动时拒绝。
+`model.policy=echo|act|smolvla` 选择实现，`model.repo_or_path` 为本地 checkpoint 目录；`model.device=auto|flex|metal` 显式选择 Burn 后端。ACT 与 SmolVLA 的预测/执行步数默认取 checkpoint，`execution.n_action_steps` 可限制执行片段；echo 的步数在示例中显式声明。配置中不支持的字段或取值在启动时拒绝。
 
 | profile | state | 相机 | action | action_interval | semantics |
 |---|---|---|---|---|---|
@@ -64,6 +64,14 @@ ACTION 的 `server_durations.queue` 从回调接收时刻计到 worker 内 predi
 ## 首个策略：官方 ACT（aloha 仿真）
 
 权重取官方 `lerobot/act_aloha_sim_transfer_cube_human`（官方 namespace 唯一的仿真 ACT checkpoint；pusht 官方无 ACT）。移植面：ResNet18（conv/BN/残差/pool）+ Transformer encoder-decoder + 位置编码 + action/state 投影，`burn::nn` 构件齐备。
+
+## SmolVLA
+
+SmolVLA 沿用 `PolicyRunner` 与 Burn 单路径，直接加载 LeRobot 本地 checkpoint。新增 SmolVLM2 视觉/文本编码与动作专家，使用 flow matching 生成动作块。`OBSERVATION.body.task` 随请求传入策略，作为语言条件；`capabilities.language` 仍表示独立的语言生成能力，不因支持任务文本而开启。请求不在策略内保留任务或 KV cache，避免 reset/close 与旧 worker 之间共享可变状态；每次推理内部缓存视觉与文本前缀。
+
+图像、状态与动作的 shape 来自 checkpoint 的特征配置，部署相机按 checkpoint 顺序匹配。tokenizer 和 VLM 配置作为本地模型资源加载，运行时不隐式联网。数值验证固定输入图像、任务 token、状态与初始噪声，对照官方 Python 的前缀表示、速度场及最终动作块；普通测试使用小尺寸模块覆盖注意力、位置编码、预处理和动作截取。
+
+LIBERO 闭环由 `scripts/libero_benchmark.py` 驱动官方 `LiberoEnv` 和 `LiberoProcessorStep`，环境/控制归 LeRobot，Pneuma 只做远程动作块推理。原 SmolVLA LIBERO 配置的 state6/stats8 冲突通过独立评测配置副本显式修正为官方 state8，两路真实相机不补伪第三路；保留原权重与逐项修改记录。默认 spatial 十任务、每任务五局，逐局原子落盘，Python CPU 与 Metal 分别采样噪声，报告初始状态配对及描述性成功率；不将其视为固定噪声数值对齐或标准全量榜单。详见 `docs/libero-benchmark.md`。
 
 ## 里程碑
 

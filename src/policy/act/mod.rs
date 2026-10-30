@@ -395,7 +395,12 @@ impl PolicyRunner for ActPolicy {
         validate_contract(&caps.features, &caps.action_feature)
     }
 
-    fn predict(&self, caps: &Capabilities, features: &Value) -> Result<Chunk, ProtocolError> {
+    fn predict(
+        &self,
+        caps: &Capabilities,
+        features: &Value,
+        _task: Option<&str>,
+    ) -> Result<Chunk, ProtocolError> {
         features
             .as_map()
             .ok_or_else(|| ProtocolError::new(ErrorCode::Malformed, "features must be a map"))?;

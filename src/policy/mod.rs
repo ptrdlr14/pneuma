@@ -1,8 +1,9 @@
 //! 推理后端边界：server 只依赖 `PolicyRunner`，模型接入时替换实现即可。
 //! echo 桩返回全零 action chunk，用于打通协议链路和延迟测量；
-//! act 是 Burn 原生实现的 ACT 策略（权重直载 lerobot safetensors checkpoint）。
+//! act 与 smolvla 用 Burn 原生执行，直接加载 LeRobot safetensors checkpoint。
 
 pub mod act;
+pub mod smolvla;
 
 use rmpv::Value;
 
@@ -16,8 +17,13 @@ pub struct Chunk {
 }
 
 pub trait PolicyRunner: Send + Sync {
-    /// features 是观测 body 里已按名字组织的 msgpack map；实现自行解 tensor/rgb。
-    fn predict(&self, caps: &Capabilities, features: &Value) -> Result<Chunk, ProtocolError>;
+    /// features 是已验证的观测特征 map；task 来自同次观测，用于语言条件策略。
+    fn predict(
+        &self,
+        caps: &Capabilities,
+        features: &Value,
+        task: Option<&str>,
+    ) -> Result<Chunk, ProtocolError>;
 
     /// 装载期自检：权重固有维度与通告合约不一致属配置错误，必须启动即报错，
     /// 不能拖到首次推理在算子内部 panic。
@@ -28,7 +34,12 @@ pub trait PolicyRunner: Send + Sync {
 pub struct ZeroActionPolicy;
 
 impl PolicyRunner for ZeroActionPolicy {
-    fn predict(&self, caps: &Capabilities, _features: &Value) -> Result<Chunk, ProtocolError> {
+    fn predict(
+        &self,
+        caps: &Capabilities,
+        _features: &Value,
+        _task: Option<&str>,
+    ) -> Result<Chunk, ProtocolError> {
         let invalid_size = || {
             ProtocolError::new(
                 crate::protocol::ErrorCode::Execution,
@@ -86,6 +97,18 @@ pub fn build(
                 let (prediction, execution) = policy.horizon();
                 (std::sync::Arc::new(policy), prediction, execution)
             }
+            Policy::Smolvla => {
+                let policy = smolvla::SmolVlaPolicy::load_configured(
+                    &cfg.model.repo_or_path,
+                    cfg.model.vlm_path.as_deref(),
+                    cfg.model.device,
+                    cfg.execution.warmup_calls,
+                    &cfg.features,
+                    &cfg.action_feature,
+                )?;
+                let (prediction, execution) = policy.horizon();
+                (std::sync::Arc::new(policy), prediction, execution)
+            }
         };
     let execution_steps = cfg.execution.n_action_steps.unwrap_or(default_steps);
     anyhow::ensure!(
@@ -107,7 +130,7 @@ mod tests {
         let (_, mut caps) = build(&cfg).unwrap();
         caps.execution_steps = u64::MAX;
         let error = ZeroActionPolicy
-            .predict(&caps, &crate::protocol::map([]))
+            .predict(&caps, &crate::protocol::map([]), None)
             .err()
             .expect("overflow must return an execution error");
         assert_eq!(error.code, crate::protocol::ErrorCode::Execution);
@@ -117,7 +140,9 @@ mod tests {
     fn echo_produces_advertised_zero_actions() {
         let cfg = ServerConfig::load(std::path::Path::new("examples/so101.toml")).unwrap();
         let (policy, caps) = build(&cfg).unwrap();
-        let chunk = policy.predict(&caps, &crate::protocol::map([])).unwrap();
+        let chunk = policy
+            .predict(&caps, &crate::protocol::map([]), None)
+            .unwrap();
         assert_eq!(chunk.execution_steps, caps.execution_steps);
         assert_eq!(
             chunk.canonical_actions.len() as u64,

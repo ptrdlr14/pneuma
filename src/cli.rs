@@ -27,6 +27,9 @@ struct ModelArgs {
     /// 本地 checkpoint 目录
     #[arg(long)]
     checkpoint: Option<PathBuf>,
+    /// SmolVLA 本地 VLM 配置与 tokenizer 资源目录
+    #[arg(long)]
+    vlm_path: Option<PathBuf>,
     /// 推理设备
     #[arg(long, value_enum)]
     device: Option<DeviceArg>,
@@ -46,6 +49,7 @@ enum DeviceArg {
 enum PolicyArg {
     Echo,
     Act,
+    Smolvla,
 }
 
 #[derive(Debug, Args)]
@@ -57,7 +61,7 @@ struct ExecutionArgs {
     /// 每次预测后执行的动作步数
     #[arg(long)]
     action_steps: Option<u64>,
-    /// echo 预测步数；ACT 从 checkpoint 读取
+    /// echo 预测步数；模型策略从 checkpoint 读取
     #[arg(long)]
     prediction_steps: Option<u64>,
     /// 启动预热次数
@@ -97,6 +101,9 @@ impl Cli {
         if let Some(path) = self.model.checkpoint {
             config.model.repo_or_path = path;
         }
+        if let Some(path) = self.model.vlm_path {
+            config.model.vlm_path = Some(path);
+        }
         if let Some(device) = self.model.device {
             config.model.device = match device {
                 DeviceArg::Auto => Device::Auto,
@@ -108,6 +115,7 @@ impl Cli {
             config.model.policy = match policy {
                 PolicyArg::Echo => Policy::Echo,
                 PolicyArg::Act => Policy::Act,
+                PolicyArg::Smolvla => Policy::Smolvla,
             };
         }
         if let Some(fps) = self.execution.action_fps {
@@ -196,6 +204,26 @@ mod tests {
         let config = load(&["--listen=tcp/127.0.0.1:7999", "--clear-connect"]);
         assert_eq!(config.zenoh.listen_endpoints, ["tcp/127.0.0.1:7999"]);
         assert!(config.zenoh.connect_endpoints.is_empty());
+    }
+
+    #[test]
+    fn smolvla_options_use_checkpoint_horizon_and_local_vlm_resources() {
+        let cli = Cli::try_parse_from([
+            "pneuma",
+            "--config=examples/smolvla_libero.toml",
+            "--policy=smolvla",
+            "--checkpoint=/tmp/policy",
+            "--vlm-path=/tmp/local VLM",
+            "--action-steps=10",
+        ])
+        .unwrap();
+        let mut config = ServerConfig::load(&cli.config).unwrap();
+        cli.apply(&mut config);
+        config.validate().unwrap();
+        assert!(matches!(config.model.policy, Policy::Smolvla));
+        assert_eq!(config.model.vlm_path, Some(PathBuf::from("/tmp/local VLM")));
+        assert_eq!(config.execution.prediction_steps, None);
+        assert_eq!(config.execution.n_action_steps, Some(10));
     }
 
     #[test]

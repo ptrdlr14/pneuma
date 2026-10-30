@@ -15,6 +15,7 @@ safetensors = "0.8.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 thiserror = "2.0.21"
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync"] }
 toml = "1.1.8"
 tracing = "0.1.44"

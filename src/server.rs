@@ -184,6 +184,9 @@ impl Server {
                 crate::config::Policy::Act => {
                     format!("pneuma-act:{}", self.cfg.model.repo_or_path.display())
                 }
+                crate::config::Policy::Smolvla => {
+                    format!("pneuma-smolvla:{}", self.cfg.model.repo_or_path.display())
+                }
             })
     }
 
@@ -867,6 +870,7 @@ impl Server {
             let result = policy.predict(
                 &caps,
                 body_get(&envelope.body, "features").expect("validated features"),
+                body_str(&envelope.body, "task"),
             );
             let finished = Instant::now();
             Completion {
@@ -1215,6 +1219,82 @@ mod tests {
         }
     }
 
+    struct TaskPolicy;
+
+    impl PolicyRunner for TaskPolicy {
+        fn predict(
+            &self,
+            caps: &Capabilities,
+            _features: &Value,
+            task: Option<&str>,
+        ) -> Result<crate::policy::Chunk, ProtocolError> {
+            let value = match task {
+                Some("pick red") => 1f32,
+                Some("pick blue") => 2f32,
+                _ => {
+                    return Err(ProtocolError::new(
+                        ErrorCode::Execution,
+                        "task was not forwarded",
+                    ));
+                }
+            };
+            Ok(crate::policy::Chunk {
+                canonical_actions: std::iter::repeat_n(
+                    value,
+                    (caps.execution_steps * caps.action_feature.shape[0]) as usize,
+                )
+                .flat_map(f32::to_le_bytes)
+                .collect(),
+                execution_steps: caps.execution_steps,
+            })
+        }
+
+        fn validate_against(&self, _caps: &Capabilities) -> Result<(), ProtocolError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn observation_task_conditions_each_prediction_and_is_returned_with_actions() {
+        let mut server = server();
+        server.policy = Arc::new(TaskPolicy);
+        let wire = Wire::start_with(server).await;
+        let accepted = wire.admit().await;
+        for (task, expected) in [("pick red", 1f32), ("pick blue", 2f32)] {
+            let envelope = request(
+                MessageType::Observation,
+                &wire.instance,
+                &accepted.session_id,
+                0,
+                map([
+                    (
+                        "features",
+                        map([(
+                            "observation.state",
+                            codec::tensor_record("float32", &[6], vec![0; 24]),
+                        )]),
+                    ),
+                    ("task", task.into()),
+                ]),
+            );
+            let reply = wire
+                .publish_reply(&accepted.session_id, "obs", "act", &envelope)
+                .await;
+            assert_eq!(reply.message_type, MessageType::Action, "{reply:?}");
+            assert_eq!(body_str(&reply.body, "task"), Some(task));
+            let actions =
+                codec::decode_record(body_get(&reply.body, "canonical_actions").unwrap()).unwrap();
+            assert!(
+                actions
+                    .data
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|bytes| f32::from_le_bytes(*bytes) == expected)
+            );
+        }
+    }
+
     struct SlowPolicy {
         entered: tokio::sync::mpsc::UnboundedSender<()>,
         gate: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
@@ -1252,6 +1332,7 @@ mod tests {
             &self,
             caps: &Capabilities,
             features: &Value,
+            task: Option<&str>,
         ) -> Result<crate::policy::Chunk, ProtocolError> {
             self.entered.send(()).unwrap();
             let released = self.gate.0.lock().expect("gate poisoned");
@@ -1264,7 +1345,7 @@ mod tests {
             if self.fails {
                 Err(ProtocolError::new(ErrorCode::Execution, "gated failure"))
             } else {
-                crate::policy::ZeroActionPolicy.predict(caps, features)
+                crate::policy::ZeroActionPolicy.predict(caps, features, task)
             }
         }
 
@@ -1522,7 +1603,7 @@ mod tests {
             map([]),
         );
         let chunk = crate::policy::ZeroActionPolicy
-            .predict(&server.caps, &map([]))
+            .predict(&server.caps, &map([]), None)
             .unwrap();
         server
             .complete_observation(
