@@ -234,7 +234,7 @@ pub fn decode_record(value: &Value) -> Result<TensorRecord<'_>, ProtocolError> {
 /// 对齐 Python `_validate_data`；f16 的有限性检查留待接入真实策略时补。
 pub fn validate_features(
     features: &Value,
-    specs: &[crate::protocol::FeatureSpec],
+    specs: &[crate::contract::FeatureSpec],
 ) -> Result<(), ProtocolError> {
     features
         .as_map()
@@ -287,6 +287,64 @@ pub fn f32_le(values: &[f32]) -> Vec<u8> {
     out
 }
 
+/// 将已验证的在线记录转换为与协议无关的主机 batch。
+pub fn observation_batch(
+    features: &Value,
+    task: Option<&str>,
+) -> Result<crate::processor::Batch, ProtocolError> {
+    use crate::processor::{Batch, Data};
+    let mut batch = Batch {
+        tasks: task.map(|s| vec![s.to_owned()]).unwrap_or_default(),
+        ..Batch::default()
+    };
+    let entries = features
+        .as_map()
+        .ok_or_else(|| ProtocolError::new(ErrorCode::Malformed, "features must be a map"))?;
+    for (name, value) in entries {
+        let name = name.as_str().ok_or_else(|| {
+            ProtocolError::new(ErrorCode::Malformed, "feature name must be a string")
+        })?;
+        let record = decode_record(value)?;
+        let shape = record
+            .shape
+            .iter()
+            .map(|&d| usize::try_from(d))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| {
+                ProtocolError::new(ErrorCode::Malformed, "feature shape exceeds platform size")
+            })?;
+        let data = match record.dtype.as_str() {
+            "uint8" => Data::U8 {
+                values: record.data.to_vec(),
+                shape,
+            },
+            "float32" => Data::F32 {
+                values: record
+                    .data
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|bytes| f32::from_le_bytes(*bytes))
+                    .collect(),
+                shape,
+            },
+            other => {
+                return Err(ProtocolError::new(
+                    ErrorCode::Incompatible,
+                    format!("pipeline input dtype {other} is unsupported"),
+                ));
+            }
+        };
+        if batch.values.insert(name.to_owned(), data).is_some() {
+            return Err(ProtocolError::new(
+                ErrorCode::Malformed,
+                "duplicate observation feature",
+            ));
+        }
+    }
+    Ok(batch)
+}
+
 /// 从观测 body 原样摘出身份键回带进动作 body。
 pub fn identity_subset(body: &Value) -> Vec<(String, Value)> {
     IDENTITY_KEYS
@@ -298,7 +356,8 @@ pub fn identity_subset(body: &Value) -> Vec<(String, Value)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{Envelope, FeatureSpec, MessageType};
+    use crate::contract::FeatureSpec;
+    use crate::protocol::{Envelope, MessageType};
 
     fn envelope(kind: MessageType, body: Value) -> Envelope {
         Envelope {

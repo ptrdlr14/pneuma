@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 
-use crate::protocol::{Capabilities, FeatureSpec, deployment_prefix};
+use crate::contract::FeatureSpec;
+use crate::protocol::{Capabilities, deployment_prefix};
 
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -32,9 +33,6 @@ pub struct ModelConfig {
     pub repo_or_path: PathBuf,
     #[serde(default)]
     pub device: Device,
-    /// SmolVLA 的本地 VLM config.json 与 tokenizer 资源目录；默认使用 checkpoint/vlm。
-    #[serde(default)]
-    pub vlm_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -4,15 +4,7 @@
 // zenoh 的 IntoHandler 泛型链在默认 128 层内证不完 callback 闭包的 Send。
 #![recursion_limit = "256"]
 
-mod cli;
-mod codec;
-mod config;
-mod policy;
-mod protocol;
-mod server;
-
-use config::ServerConfig;
-use server::Server;
+use pneuma::{cli, config::ServerConfig, server::Server};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -25,7 +17,12 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = cli::Cli::parse();
-    let mut config = ServerConfig::load(&cli.config)?;
-    cli.apply(&mut config);
-    Server::new(config)?.run().await
+    match cli.command {
+        cli::Command::Serve(args) => {
+            let mut config = ServerConfig::load(&args.config)?;
+            args.apply(&mut config);
+            Server::new(config)?.run().await
+        }
+        cli::Command::Convert(args) => args.run(),
+    }
 }

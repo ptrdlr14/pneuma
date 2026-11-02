@@ -1,6 +1,7 @@
 //! 真实 checkpoint 数值对齐需要先运行 dump_smolvla_reference.py。
 
 use super::*;
+use crate::processor::{Context, Mode};
 
 fn read_f32(dir: &Path, manifest: &serde_json::Value, name: &str) -> Vec<f32> {
     let file = manifest["tensors"][name]["file"]
@@ -61,7 +62,7 @@ fn smolvla_parity() {
             } else {
                 vec![f.shape[0] as u64]
             };
-            crate::protocol::FeatureSpec {
+            crate::contract::FeatureSpec {
                 name: name.clone(),
                 shape,
                 dtype: if visual { "uint8" } else { "float32" }.into(),
@@ -71,7 +72,7 @@ fn smolvla_parity() {
             }
         })
         .collect();
-    let action = crate::protocol::FeatureSpec {
+    let action = crate::contract::FeatureSpec {
         name: "action".into(),
         shape: vec![cfg.action_dim() as u64],
         dtype: "float32".into(),
@@ -83,67 +84,100 @@ fn smolvla_parity() {
         Ok("metal") => crate::config::Device::Metal,
         _ => crate::config::Device::Flex,
     };
-    let policy = SmolVlaPolicy::load_configured(
-        &dir.join("checkpoint"),
-        Some(&vlm),
-        backend,
-        0,
-        &features,
-        &action,
-    )
-    .unwrap();
+    let (policy, preprocessor, postprocessor) =
+        if let Some(native) = std::env::var_os("PNEUMA_SMOLVLA_NATIVE") {
+            let checkpoint = crate::checkpoint::Checkpoint::load(Path::new(&native)).unwrap();
+            let policy = SmolVlaPolicy::load_model(
+                &checkpoint.model_dir,
+                checkpoint.vlm_path.as_deref(),
+                backend,
+            )
+            .unwrap();
+            (policy, checkpoint.preprocessor, checkpoint.postprocessor)
+        } else {
+            let (policy, pre, post, _) = SmolVlaPolicy::import_configured(
+                &dir.join("checkpoint"),
+                Some(&vlm),
+                backend,
+                &features,
+                &action,
+            )
+            .unwrap();
+            (policy, pre, post)
+        };
+    let task = manifest["task"].as_str().unwrap_or("pick up the red cube");
     let raw_state = read_f32(&dir, &manifest, "raw_state");
-    let state = policy.processor.state(&raw_state, &policy.device);
+    let mut raw = Batch {
+        values: [(
+            "observation.state".into(),
+            Data::F32 {
+                values: raw_state,
+                shape: vec![cfg.state_dim()],
+            },
+        )]
+        .into(),
+        tasks: vec![task.into()],
+    };
+    for (index, (name, feature)) in cfg.image_features().enumerate() {
+        let values = read_f32(&dir, &manifest, &format!("raw_image_{index}"))
+            .into_iter()
+            .map(|value| value as u8)
+            .collect();
+        raw.values.insert(
+            name.into(),
+            Data::U8 {
+                values,
+                shape: vec![feature.shape[1], feature.shape[2], 3],
+            },
+        );
+    }
+    let context = Context {
+        device: policy.device(),
+        mode: Mode::Eval,
+    };
+    let mut prepared = preprocessor.run(raw.clone(), &context).unwrap();
+    let state = prepared
+        .take("observation.state")
+        .unwrap()
+        .into_float2()
+        .unwrap();
     compare(
         "state_padded",
         &state.clone().into_data().try_to_vec::<f32>().unwrap(),
         &read_f32(&dir, &manifest, "state_padded"),
         1e-6,
     );
-    let task = manifest["task"].as_str().unwrap_or("pick up the red cube");
-    let (tokens, valid) = policy.processor.tokenize(task).unwrap();
+    let Data::Int2(tokens) = prepared.take("observation.language.tokens").unwrap() else {
+        panic!("expected prepared integer tokens");
+    };
+    let tokens = tokens.into_data().iter::<i64>().collect::<Vec<_>>();
+    let Data::Bool2(valid) = prepared
+        .take("observation.language.attention_mask")
+        .unwrap()
+    else {
+        panic!("expected prepared boolean token mask");
+    };
+    let valid = valid.into_data().iter::<bool>().collect::<Vec<_>>();
     assert_eq!(
-        tokens.iter().map(|&x| x as f32).collect::<Vec<_>>(),
+        tokens.iter().map(|&value| value as f32).collect::<Vec<_>>(),
         read_f32(&dir, &manifest, "tokens")
     );
     assert_eq!(
         valid
             .iter()
-            .map(|&x| u8::from(x) as f32)
+            .map(|&value| u8::from(value) as f32)
             .collect::<Vec<_>>(),
         read_f32(&dir, &manifest, "token_mask")
     );
     let mut images = Vec::new();
-    let mut feature_records = vec![(
-        Value::from("observation.state"),
-        codec::tensor_record(
-            "float32",
-            &[cfg.state_dim() as u64],
-            raw_state.iter().flat_map(|v| v.to_le_bytes()).collect(),
-        ),
-    )];
-    for (index, (name, feature)) in cfg.image_features().enumerate() {
-        let raw: Vec<_> = read_f32(&dir, &manifest, &format!("raw_image_{index}"))
-            .iter()
-            .map(|&v| v as u8)
-            .collect();
-        let (h, w) = (feature.shape[1], feature.shape[2]);
-        let image = policy.processor.image(&raw, h, w, &policy.device);
+    for (index, (name, _)) in cfg.image_features().enumerate() {
+        let image = prepared.take(name).unwrap().into_float4().unwrap();
         compare(
             &format!("image_prepared_{index}"),
             &image.clone().into_data().try_to_vec::<f32>().unwrap(),
             &read_f32(&dir, &manifest, &format!("image_prepared_{index}")),
             5e-6,
         );
-        let record = crate::protocol::map([
-            (codec::MARKER, "rgb".into()),
-            ("dtype", "uint8".into()),
-            ("shape", Value::Array(vec![h.into(), w.into(), 3.into()])),
-            ("channel_order", "RGB".into()),
-            ("encoding", "raw".into()),
-            ("data", Value::Binary(raw)),
-        ]);
-        feature_records.push((name.into(), record));
         images.push(image);
     }
     let model = &policy.model.vlm_with_expert.vlm.model;
@@ -204,40 +238,49 @@ fn smolvla_parity() {
         &read_f32(&dir, &manifest, "actions_padded"),
         2e-3,
     );
-    let trimmed: Vec<_> = output
-        .chunks_exact(cfg.max_action_dim)
-        .flat_map(|row| row[..cfg.action_dim()].iter().copied())
-        .collect();
+    let padded = Batch {
+        values: [(
+            "action".into(),
+            Data::Float3(Tensor::from_data(
+                TensorData::new(output, [1, cfg.chunk_size, cfg.max_action_dim]),
+                &context.device,
+            )),
+        )]
+        .into(),
+        ..Batch::default()
+    };
+    let canonical = postprocessor
+        .run(padded, &context)
+        .unwrap()
+        .take("action")
+        .unwrap()
+        .into_float3()
+        .unwrap()
+        .into_data()
+        .try_to_vec::<f32>()
+        .unwrap();
     compare(
         "actions_canonical",
-        &policy.processor.unnormalize(&trimmed),
+        &canonical,
         &read_f32(&dir, &manifest, "actions_canonical"),
         2e-3,
     );
-    let caps = Capabilities {
-        features,
-        action_feature: action,
-        execution_steps: 3,
-        prediction_steps: cfg.chunk_size as u64,
-        ..test_capabilities()
-    };
-    let chunk = policy
-        .predict(&caps, &Value::Map(feature_records), Some(task))
-        .unwrap();
-    assert_eq!(chunk.execution_steps, 3);
-    assert_eq!(chunk.canonical_actions.len(), 3 * cfg.action_dim() * 4);
-    assert!(
-        chunk
-            .canonical_actions
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .all(|v| f32::from_le_bytes(*v).is_finite())
-    );
-}
 
-fn test_capabilities() -> Capabilities {
-    crate::config::ServerConfig::load(Path::new("examples/so101.toml"))
+    // 通用模型接口返回完整 horizon 和模型动作维度，执行片段由 runner 截取。
+    let output = policy
+        .predict(preprocessor.run(raw, &context).unwrap())
         .unwrap()
-        .capabilities(50, 3)
+        .take("action")
+        .unwrap()
+        .into_float3()
+        .unwrap();
+    assert_eq!(output.dims(), [1, cfg.chunk_size, cfg.max_action_dim]);
+    assert!(
+        output
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap()
+            .iter()
+            .all(|value| value.is_finite())
+    );
 }

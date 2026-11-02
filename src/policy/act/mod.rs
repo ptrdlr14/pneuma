@@ -1,5 +1,5 @@
-//! Burn 原生 ACT：字段名对齐 torch 属性名，safetensors 直载（`PyTorchToBurnAdapter`），
-//! 预处理复刻官方 remote 服务侧 `policy_runner._batch` + normalize/unnormalize 缓冲。
+//! Burn 原生 ACT：部署加载 bpk，LeRobot 参数布局只在转换边界适配，
+//! 旧 checkpoint 的归一化缓冲在导入时转换为共享输入 / 输出 pipeline。
 //! 推理路径 `use_vae` 下 z=0（eval 语义），`vae_encoder` 权重不加载。
 
 pub mod config;
@@ -11,11 +11,10 @@ use burn::module::Module;
 use burn::nn::conv::Conv2d;
 use burn::nn::{Linear, LinearConfig};
 use burn::tensor::{Device, DeviceKind, Tensor, TensorData};
-use rmpv::Value;
 
-use crate::codec;
-use crate::policy::{Chunk, PolicyRunner};
-use crate::protocol::{Capabilities, ErrorCode, FeatureSpec, ProtocolError, body_get};
+use crate::contract::FeatureSpec;
+use crate::policy::Policy;
+use crate::processor::{Batch, DType, Data, Field, Layout, Pipeline, Schema, Step};
 
 use config::ActConfig;
 use position::sinusoidal_2d;
@@ -197,46 +196,93 @@ impl NormStats {
         }
         Ok(())
     }
-    fn preprocess(
-        &self,
-        state: &[f32],
-        image_hwc: &[u8],
-        device: &Device,
-    ) -> (Tensor<2>, Tensor<4>) {
-        let s = self;
-        let state_n: Vec<f32> = state
-            .iter()
-            .zip(&s.state_mean)
-            .zip(&s.state_std)
-            .map(|((x, m), d)| (x - m) / d)
-            .collect();
-        let state_t = Tensor::<2, _>::from_data(TensorData::new(state_n, [1, state.len()]), device);
 
-        // 480×640 固定合约；行主序 HWC → CHW。
-        let (h, w) = (480usize, 640usize);
-        let mut chw = vec![0f32; 3 * h * w];
-        for (i, &v) in image_hwc.iter().enumerate() {
-            let c = i % 3;
-            let pos = i / 3;
-            chw[c * h * w + pos] = (f32::from(v) / 255.0 - s.image_mean[c]) / s.image_std[c];
-        }
-        let image_t = Tensor::<4, _>::from_data(TensorData::new(chw, [1, 3, h, w]), device);
-        (state_t, image_t)
-    }
-
-    fn unnormalize_actions(&self, flat: &[f32]) -> Vec<f32> {
-        let dim = self.action_mean.len();
-        flat.iter()
-            .enumerate()
-            .map(|(i, v)| v * self.action_std[i % dim] + self.action_mean[i % dim])
-            .collect()
+    fn into_pipelines(self, chunk_size: usize) -> anyhow::Result<(Pipeline, Pipeline)> {
+        self.validate()?;
+        let input: Schema = [
+            (
+                "observation.state".into(),
+                Field {
+                    shape: vec![Some(14)],
+                    dtype: DType::F32,
+                    layout: Layout::Flat,
+                    optional: false,
+                },
+            ),
+            (
+                "observation.images.top".into(),
+                Field {
+                    shape: vec![Some(480), Some(640), Some(3)],
+                    dtype: DType::U8,
+                    layout: Layout::Hwc,
+                    optional: false,
+                },
+            ),
+            (
+                "action".into(),
+                Field {
+                    shape: vec![None, Some(14)],
+                    dtype: DType::F32,
+                    layout: Layout::Flat,
+                    optional: true,
+                },
+            ),
+        ]
+        .into();
+        let pre = Pipeline::new(
+            input,
+            vec![
+                Step::Batch,
+                Step::Rgb {
+                    key: "observation.images.top".into(),
+                },
+                Step::Affine {
+                    key: "observation.images.top".into(),
+                    offset: self.image_mean.to_vec(),
+                    scale: self.image_std.to_vec(),
+                    axis: 1,
+                },
+                Step::Affine {
+                    key: "observation.state".into(),
+                    offset: self.state_mean,
+                    scale: self.state_std,
+                    axis: 1,
+                },
+                Step::Affine {
+                    key: "action".into(),
+                    offset: self.action_mean.clone(),
+                    scale: self.action_std.clone(),
+                    axis: 2,
+                },
+                Step::Device,
+            ],
+        )?;
+        let output: Schema = [(
+            "action".into(),
+            Field {
+                shape: vec![None, Some(chunk_size), Some(14)],
+                dtype: DType::F32,
+                layout: Layout::Flat,
+                optional: false,
+            },
+        )]
+        .into();
+        let post = Pipeline::new(
+            output,
+            vec![Step::Linear {
+                key: "action".into(),
+                offset: self.action_mean,
+                scale: self.action_std,
+                axis: 2,
+            }],
+        )?;
+        Ok((pre, post))
     }
 }
 
 pub struct ActPolicy {
     model: Act,
     cfg: ActConfig,
-    stats: NormStats,
     device: Device,
 }
 
@@ -255,43 +301,57 @@ fn f32_tensor(st: &safetensors::SafeTensors, name: &str) -> anyhow::Result<Vec<f
 }
 
 impl ActPolicy {
-    /// dir 为 checkpoint 目录（config.json + model.safetensors）。
-    #[cfg(test)]
-    pub fn load(dir: &str) -> anyhow::Result<Self> {
-        Self::load_configured(std::path::Path::new(dir), crate::config::Device::Auto, 1)
+    /// 导入 LeRobot checkpoint 的模型与共享 pipeline；预热由部署执行器负责。
+    pub fn import_configured(
+        path: &std::path::Path,
+        backend: crate::config::Device,
+    ) -> anyhow::Result<(Self, Pipeline, Pipeline, Vec<String>)> {
+        let stats = NormStats::load(&path.join("model.safetensors"))?;
+        let (policy, unused) = Self::import_lerobot(path, backend)?;
+        let (pre, post) = stats.into_pipelines(policy.cfg.chunk_size)?;
+        Ok((policy, pre, post, unused))
     }
 
-    pub fn load_configured(
+    /// 从原生 checkpoint 严格恢复模型状态，不接受外部权重格式。
+    pub fn load_model(
         path: &std::path::Path,
-        device: crate::config::Device,
-        warmup_calls: usize,
+        backend: crate::config::Device,
     ) -> anyhow::Result<Self> {
         use anyhow::Context;
-        use burn_store::ModuleSnapshot;
+        let mut policy = Self::init_model(path, backend)?;
+        let record = burn::store::ModuleRecord::load(path.join("model.bpk"))
+            .context("reading native ACT model.bpk; convert the LeRobot checkpoint first")?;
+        policy.model = policy
+            .model
+            .try_load_record(record)
+            .context("restoring ACT model record")?;
+        Ok(policy)
+    }
 
+    fn init_model(path: &std::path::Path, backend: crate::config::Device) -> anyhow::Result<Self> {
         let cfg = config::parse(&path.join("config.json"))?;
-        let dir = path.display();
-        let device = match device {
+        let device = match backend {
             crate::config::Device::Auto => Device::default(),
             crate::config::Device::Flex => Device::flex(),
             crate::config::Device::Metal => Device::metal(DeviceKind::default()),
         };
-        tracing::info!("act model on device {device:?}");
-        let mut model = cfg.init(&device);
+        let model = cfg.init(&device);
+        Ok(Self { model, cfg, device })
+    }
 
-        let mut store = burn_store::SafetensorsStore::from_file(path.join("model.safetensors"))
-            .with_from_adapter(burn_store::PyTorchToBurnAdapter)
-            // state_dict 以 self.model（ACT）为前缀；act 根模块剥掉它。
-            .with_key_remapping(r"^model\.", "")
-            // torch 的 in_proj_weight 是单参数名，Rust 侧走子模块路径。
-            .with_key_remapping(r"\.in_proj_weight$", ".in_proj.weight")
-            .with_key_remapping(r"\.in_proj_bias$", ".in_proj.bias")
-            // downsample 的 Sequential 索引段 → 具名字段。
-            .with_key_remapping(r"\.downsample\.0\.", ".downsample.conv.")
-            .with_key_remapping(r"\.downsample\.1\.", ".downsample.norm.")
-            // vae_encoder 与归一化缓冲不属于本模块。
-            .allow_partial(true);
-        let applied = model
+    /// 转换边界导入完整推理模块，额外参数由 checkpoint 转换器保存。
+    pub fn import_lerobot(
+        path: &std::path::Path,
+        backend: crate::config::Device,
+    ) -> anyhow::Result<(Self, Vec<String>)> {
+        use anyhow::Context;
+        use burn_store::ModuleSnapshot;
+        let mut policy = Self::init_model(path, backend)?;
+        let dir = path.display();
+
+        let mut store = lerobot_import_store(&path.join("model.safetensors"));
+        let applied = policy
+            .model
             .load_from(&mut store)
             .with_context(|| format!("applying weights from {dir}/model.safetensors"))?;
         // allow_partial 只放行 vae_encoder/归一化缓冲（unused 侧）；
@@ -309,49 +369,61 @@ impl ActPolicy {
             applied.unused.len()
         );
 
-        let stats = NormStats::load(&path.join("model.safetensors"))?;
-        let policy = Self {
-            model,
-            cfg,
-            stats,
-            device,
-        };
-        // 预热：metal 后端首推理含内核 JIT（秒级），挪进启动期，首个控制周期不受影响。
-        // 附带自检：坏权重/后端缺算子在这里快速失败，而不是留到客户端第一次请求。
-        let started = std::time::Instant::now();
-        for _ in 0..warmup_calls {
-            policy.run(
-                &vec![0.0; policy.stats.state_mean.len()],
-                &vec![0u8; 480 * 640 * 3],
-            );
-        }
-        tracing::info!("warmup forward 完成，用时 {:?}", started.elapsed());
-        Ok(policy)
+        Ok((policy, applied.unused))
+    }
+
+    /// 保存当前内存参数与参数身份，供原生加载和后续训练恢复使用。
+    pub fn save_native(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        self.model.clone().into_record().save(path)?;
+        Ok(())
+    }
+
+    /// 导出当前推理模块的 PyTorch 参数名和布局；附属参数由转换器合并。
+    pub fn export_lerobot(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        use burn_store::ModuleSnapshot;
+        let mut store = lerobot_export_store(path);
+        self.model.save_into(&mut store)?;
+        Ok(())
     }
 
     pub fn horizon(&self) -> (u64, u64) {
         (self.cfg.chunk_size as u64, self.cfg.n_action_steps as u64)
     }
 
-    /// 官方服务侧 _batch 等价：rgb→CHW f32 /255 → (x-mean)/std；state (x-mean)/std。
-    fn preprocess(&self, state: &[f32], image_hwc: &[u8]) -> (Tensor<2>, Tensor<4>) {
-        self.stats.preprocess(state, image_hwc, &self.device)
+    /// 返回模型所在设备，供执行器构造 pipeline 上下文。
+    pub fn device(&self) -> Device {
+        self.device.clone()
     }
+}
 
-    fn run(&self, state: &[f32], image_hwc: &[u8]) -> Vec<f32> {
-        let (state_t, image_t) = self.preprocess(state, image_hwc);
-        let out = self.model.forward(state_t, image_t, self.cfg.latent_dim);
-        let flat: Vec<f32> = out.into_data().iter::<f32>().collect();
-        self.stats.unnormalize_actions(&flat)
-    }
+fn lerobot_import_store(path: &std::path::Path) -> burn_store::SafetensorsStore {
+    use burn_store::ModuleAdapter;
+    burn_store::SafetensorsStore::from_file(path)
+        .with_from_adapter(
+            burn_store::PyTorchToBurnAdapter
+                .chain(burn_store::FloatCastAdapter::to(burn::tensor::DType::F32)),
+        )
+        .with_key_remapping(r"^model\.", "")
+        .with_key_remapping(r"(^|\.)in_proj_weight$", "${1}in_proj.weight")
+        .with_key_remapping(r"(^|\.)in_proj_bias$", "${1}in_proj.bias")
+        .with_key_remapping(r"\.downsample\.0\.", ".downsample.conv.")
+        .with_key_remapping(r"\.downsample\.1\.", ".downsample.norm.")
+        .allow_partial(true)
+}
+
+fn lerobot_export_store(path: &std::path::Path) -> burn_store::SafetensorsStore {
+    burn_store::SafetensorsStore::from_file(path)
+        .with_to_adapter(burn_store::BurnToPyTorchAdapter)
+        .with_key_remapping(r"(^|\.)in_proj\.weight$", "${1}in_proj_weight")
+        .with_key_remapping(r"(^|\.)in_proj\.bias$", "${1}in_proj_bias")
+        .with_key_remapping(r"\.downsample\.conv\.", ".downsample.0.")
+        .with_key_remapping(r"\.downsample\.norm\.", ".downsample.1.")
+        .with_key_remapping(r"^", "model.")
 }
 
 /// 合约维度 × 权重维度的纯比对：错位是 profile 与 checkpoint 的配置错误，
 /// 启动即报错好过一次 matmul panic；提出为纯函数以便用 profile 单测。
-pub fn validate_contract(
-    features: &[FeatureSpec],
-    action: &FeatureSpec,
-) -> Result<(), ProtocolError> {
+pub fn validate_contract(features: &[FeatureSpec], action: &FeatureSpec) -> anyhow::Result<()> {
     let state = features.iter().find(|f| f.name == "observation.state");
     let image = features.iter().find(|f| f.name == "observation.images.top");
     if features.len() != 2
@@ -362,10 +434,9 @@ pub fn validate_contract(
         || action.dtype != "float32"
         || action.shape != [14]
     {
-        return Err(ProtocolError::new(
-            ErrorCode::Incompatible,
-            "ACT requires observation.state [14], observation.images.top [480,640,3], and action [14]",
-        ));
+        anyhow::bail!(
+            "ACT requires observation.state [14], observation.images.top [480,640,3], and action [14]"
+        );
     }
     Ok(())
 }
@@ -379,105 +450,134 @@ fn profile_mismatched_with_checkpoint_is_startup_error() {
         .unwrap()
         .capabilities(50, 16);
     let error = validate_contract(&caps.features, &caps.action_feature).unwrap_err();
-    assert_eq!(error.code, ErrorCode::Incompatible);
+    assert!(error.to_string().contains("ACT requires"), "{error}");
     let mut cfg = ServerConfig::load(std::path::Path::new("examples/aloha_sim.toml")).unwrap();
     assert!(validate_contract(&cfg.features, &cfg.action_feature).is_ok());
     cfg.features[1].shape = vec![240, 320, 3];
     cfg.model.repo_or_path = "/nonexistent/checkpoint".into();
-    let Err(error) = crate::policy::build(&cfg) else {
+    let Err(error) = crate::deployment::build(&cfg) else {
         panic!("unsupported ACT image contract accepted");
     };
     assert!(error.to_string().contains("ACT requires"), "{error}");
 }
 
-impl PolicyRunner for ActPolicy {
-    fn validate_against(&self, caps: &Capabilities) -> Result<(), ProtocolError> {
-        validate_contract(&caps.features, &caps.action_feature)
-    }
-
-    fn predict(
-        &self,
-        caps: &Capabilities,
-        features: &Value,
-        _task: Option<&str>,
-    ) -> Result<Chunk, ProtocolError> {
-        features
-            .as_map()
-            .ok_or_else(|| ProtocolError::new(ErrorCode::Malformed, "features must be a map"))?;
-        // server 已按 caps 校验过形状/类型，这里只做取数。
-        let state_rec = codec::decode_record(
-            body_get(features, "observation.state")
-                .ok_or_else(|| ProtocolError::new(ErrorCode::Incompatible, "missing state"))?,
-        )?;
-        if state_rec.dtype != "float32" {
-            return Err(ProtocolError::new(ErrorCode::Incompatible, "state dtype"));
-        }
-        let state: Vec<f32> = state_rec
-            .data
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|b| f32::from_le_bytes(*b))
-            .collect();
-
-        let image_name = caps
-            .features
-            .iter()
-            .find(|f| f.kind == "rgb")
-            .map(|f| f.name.clone())
-            .ok_or_else(|| {
-                ProtocolError::new(ErrorCode::Execution, "profile has no rgb feature")
-            })?;
-        let image_rec = codec::decode_record(
-            body_get(features, &image_name)
-                .ok_or_else(|| ProtocolError::new(ErrorCode::Incompatible, "missing image"))?,
-        )?;
-        if image_rec.dtype != "uint8" {
-            return Err(ProtocolError::new(ErrorCode::Incompatible, "image dtype"));
-        }
-
-        let flat = self.run(&state, image_rec.data);
-        execution_chunk(&flat, caps.execution_steps, self.cfg.chunk_size)
+impl Policy for ActPolicy {
+    fn predict(&self, mut batch: Batch) -> anyhow::Result<Batch> {
+        let state = batch.take("observation.state")?.into_float2()?;
+        let image = batch.take("observation.images.top")?.into_float4()?;
+        // 旧 checkpoint 导入器补单样本 batch 轴；当前 ACT 网络使用固定 B=1。
+        anyhow::ensure!(state.dims() == [1, 14], "ACT requires state [1,14]");
+        anyhow::ensure!(
+            image.dims() == [1, 3, 480, 640],
+            "ACT requires image [1,3,480,640]"
+        );
+        let action = self.model.forward(state, image, self.cfg.latent_dim);
+        Ok(Batch {
+            values: [("action".into(), Data::Float3(action))].into(),
+            tasks: batch.tasks,
+        })
     }
 }
 
-fn execution_chunk(
-    flat: &[f32],
-    requested_steps: u64,
-    chunk_size: usize,
-) -> Result<Chunk, ProtocolError> {
-    let steps = usize::try_from(requested_steps)
-        .map_err(|_| {
-            ProtocolError::new(
-                ErrorCode::Execution,
-                "execution_steps exceeds platform size",
-            )
-        })?
-        .min(chunk_size);
-    let length = steps
-        .checked_mul(14)
-        .ok_or_else(|| ProtocolError::new(ErrorCode::Execution, "action size overflows"))?;
-    let actions = flat.get(..length).ok_or_else(|| {
-        ProtocolError::new(
-            ErrorCode::Execution,
-            "model action output is shorter than execution_steps",
-        )
-    })?;
-    if actions.iter().any(|v| !v.is_finite()) {
-        return Err(ProtocolError::new(
-            ErrorCode::Execution,
-            "model action output contains non-finite values",
-        ));
+#[cfg(test)]
+fn observation_batch(state: &[f32], image: &[u8]) -> Batch {
+    Batch {
+        values: [
+            (
+                "observation.state".into(),
+                Data::F32 {
+                    values: state.to_vec(),
+                    shape: vec![14],
+                },
+            ),
+            (
+                "observation.images.top".into(),
+                Data::U8 {
+                    values: image.to_vec(),
+                    shape: vec![480, 640, 3],
+                },
+            ),
+        ]
+        .into(),
+        ..Batch::default()
     }
-    Ok(Chunk {
-        canonical_actions: codec::f32_le(actions),
-        execution_steps: steps as u64,
-    })
 }
 
 #[cfg(test)]
 mod numerical_tests {
     use super::*;
+    use crate::processor::{Context, Mode};
+
+    #[test]
+    fn native_weights_export_with_original_attention_keys_and_layout() {
+        use burn_store::ModuleSnapshot;
+        #[derive(Module, Debug)]
+        struct Layer {
+            in_proj: Linear,
+        }
+        let device = Device::flex();
+        let model = Layer {
+            in_proj: Linear {
+                weight: burn::module::Param::from_data(
+                    TensorData::new(vec![1f32, 2., 3., 4., 5., 6.], [2, 3]),
+                    &device,
+                ),
+                bias: Some(burn::module::Param::from_data(
+                    TensorData::new(vec![7f32, 8., 9.], [3]),
+                    &device,
+                )),
+            },
+        };
+        let directory = std::env::temp_dir().join(format!("act-convert-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        model
+            .clone()
+            .into_record()
+            .save(directory.join("model.bpk"))
+            .unwrap();
+        let record = burn::store::ModuleRecord::load(directory.join("model.bpk")).unwrap();
+        let fresh = Layer {
+            in_proj: LinearConfig::new(2, 3).init(&device),
+        };
+        let loaded = fresh.try_load_record(record).unwrap();
+        assert_eq!(loaded.in_proj.weight.id, model.in_proj.weight.id);
+        let path = directory.join("active.safetensors");
+        loaded.save_into(&mut lerobot_export_store(&path)).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let tensors = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+        let weight = tensors.tensor("model.in_proj_weight").unwrap();
+        assert_eq!(weight.shape(), [3, 2]);
+        let values: Vec<_> = weight
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|v| f32::from_le_bytes(*v))
+            .collect();
+        assert_eq!(values, [1., 4., 2., 5., 3., 6.]);
+        assert!(tensors.tensor("model.in_proj_bias").is_ok());
+        let mut restored = Layer {
+            in_proj: LinearConfig::new(2, 3).init(&device),
+        };
+        let applied = restored
+            .load_from(&mut lerobot_import_store(&path))
+            .unwrap();
+        assert!(
+            applied.missing.is_empty() && applied.errors.is_empty() && applied.unused.is_empty(),
+            "{applied:?}"
+        );
+        assert_eq!(
+            restored
+                .in_proj
+                .weight
+                .val()
+                .into_data()
+                .try_to_vec::<f32>()
+                .unwrap(),
+            [1., 2., 3., 4., 5., 6.]
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     fn stats() -> NormStats {
         NormStats {
@@ -496,11 +596,34 @@ mod numerical_tests {
         stats.validate().unwrap();
         let mut image = vec![0; 480 * 640 * 3];
         image[..6].copy_from_slice(&[255, 128, 0, 64, 32, 255]);
-        let (state, image) = stats.preprocess(&[5.0; 14], &image, &Device::flex());
+        let (pre, post) = self::stats().into_pipelines(3).unwrap();
+        let context = Context {
+            device: Device::flex(),
+            mode: Mode::Eval,
+        };
+        let mut batch = pre
+            .run(observation_batch(&[5.0; 14], &image), &context)
+            .unwrap();
+        assert!(
+            batch.get("action").is_err(),
+            "optional action must stay absent"
+        );
+        let state = batch
+            .take("observation.state")
+            .unwrap()
+            .into_float2()
+            .unwrap();
+        assert_eq!(state.dims(), [1, 14]);
         assert_eq!(
             state.into_data().try_to_vec::<f32>().unwrap(),
             vec![2.0; 14]
         );
+        let image = batch
+            .take("observation.images.top")
+            .unwrap()
+            .into_float4()
+            .unwrap();
+        assert_eq!(image.dims(), [1, 3, 480, 640]);
         let image = image.into_data().try_to_vec::<f32>().unwrap();
         for (channel, pixels) in [[255u8, 64], [128, 32], [0, 255]].iter().enumerate() {
             for (pixel, value) in pixels.iter().enumerate() {
@@ -509,22 +632,75 @@ mod numerical_tests {
                 assert!((image[channel * 480 * 640 + pixel] - expected).abs() < 1e-6);
             }
         }
-        let actions = stats.unnormalize_actions(&[1.0; 42]);
-        let chunk = execution_chunk(&actions, 2, 3).unwrap();
-        assert_eq!(chunk.execution_steps, 2);
-        let values: Vec<_> = chunk
-            .canonical_actions
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|v| f32::from_le_bytes(*v))
-            .collect();
-        assert_eq!(values.len(), 28);
+        let mut output = post
+            .run(
+                Batch {
+                    values: [(
+                        "action".into(),
+                        Data::Float3(Tensor::<3>::ones([1, 3, 14], &context.device)),
+                    )]
+                    .into(),
+                    ..Batch::default()
+                },
+                &context,
+            )
+            .unwrap();
+        let actions = output.take("action").unwrap().into_float3().unwrap();
+        assert_eq!(
+            actions.dims(),
+            [1, 3, 14],
+            "pipeline preserves the full prediction horizon"
+        );
+        let values = actions.into_data().try_to_vec::<f32>().unwrap();
+        assert_eq!(values.len(), 42);
         for (i, value) in values.iter().enumerate() {
             assert_eq!(*value, stats.action_mean[i % 14] + 2.0);
         }
-        assert!(execution_chunk(&[f32::NAN; 14], 1, 1).is_err());
-        assert!(execution_chunk(&[0.0; 13], 1, 1).is_err());
+    }
+
+    #[test]
+    fn training_targets_use_the_same_statistics_and_roundtrip_to_canonical_actions() {
+        let (pre, post) = stats().into_pipelines(3).unwrap();
+        let context = Context {
+            device: Device::flex(),
+            mode: Mode::Train,
+        };
+        let canonical: Vec<f32> = (0..42).map(|i| (i % 14) as f32 + 6.0).collect();
+        let mut batch = observation_batch(&[5.0; 14], &vec![0; 480 * 640 * 3]);
+        batch.values.insert(
+            "action".into(),
+            Data::F32 {
+                values: canonical.clone(),
+                shape: vec![3, 14],
+            },
+        );
+        let mut normalized = pre.run(batch, &context).unwrap();
+        let action = normalized.take("action").unwrap().into_float3().unwrap();
+        assert_eq!(action.dims(), [1, 3, 14]);
+        assert_eq!(
+            action.clone().into_data().try_to_vec::<f32>().unwrap(),
+            vec![3.0; 42]
+        );
+        let mut restored = post
+            .run(
+                Batch {
+                    values: [("action".into(), Data::Float3(action))].into(),
+                    ..Batch::default()
+                },
+                &context,
+            )
+            .unwrap();
+        assert_eq!(
+            restored
+                .take("action")
+                .unwrap()
+                .into_float3()
+                .unwrap()
+                .into_data()
+                .try_to_vec::<f32>()
+                .unwrap(),
+            canonical
+        );
     }
 
     #[test]
@@ -559,7 +735,7 @@ mod numerical_tests {
                     cfg.features.push(extra);
                 }
             }
-            let error = match crate::policy::build(&cfg) {
+            let error = match crate::deployment::build(&cfg) {
                 Ok(_) => panic!("unsupported ACT contract accepted: case {case}"),
                 Err(error) => error,
             };
@@ -594,6 +770,51 @@ mod numerical_tests {
 #[cfg(test)]
 mod diagnostics {
     use super::*;
+    use crate::processor::{Context, Mode};
+
+    fn load_checkpoint(path: &str) -> anyhow::Result<(ActPolicy, Pipeline, Pipeline)> {
+        let (policy, pre, post, _) =
+            ActPolicy::import_configured(std::path::Path::new(path), crate::config::Device::Auto)?;
+        Ok((policy, pre, post))
+    }
+
+    fn normalized_input(
+        policy: &ActPolicy,
+        pre: &Pipeline,
+        state: &[f32],
+        image: &[u8],
+    ) -> anyhow::Result<Batch> {
+        pre.run(
+            observation_batch(state, image),
+            &Context {
+                device: policy.device(),
+                mode: Mode::Eval,
+            },
+        )
+    }
+
+    fn canonical_actions(
+        policy: &ActPolicy,
+        pre: &Pipeline,
+        post: &Pipeline,
+        state: &[f32],
+        image: &[u8],
+    ) -> anyhow::Result<Vec<f32>> {
+        let input = normalized_input(policy, pre, state, image)?;
+        let output = policy.predict(input)?;
+        let mut output = post.run(
+            output,
+            &Context {
+                device: policy.device(),
+                mode: Mode::Eval,
+            },
+        )?;
+        Ok(output
+            .take("action")?
+            .into_float3()?
+            .into_data()
+            .try_to_vec::<f32>()?)
+    }
 
     fn max_abs_diff(got: &[f32], reference: &[f32]) -> anyhow::Result<(usize, f32)> {
         anyhow::ensure!(
@@ -652,8 +873,8 @@ mod diagnostics {
                 .collect()
         };
 
-        let policy = ActPolicy::load(&ckpt).unwrap();
-        let got = policy.run(&state, &image);
+        let (policy, pre, post) = load_checkpoint(&ckpt).unwrap();
+        let got = canonical_actions(&policy, &pre, &post, &state, &image).unwrap();
         let worst = max_abs_diff(&got, &reference).expect("模型与参照必须等长且逐元素有限");
         println!("max abs diff = {:.3e} @ {}", worst.1, worst.0);
         assert!(worst.1 < 5e-3, "与 python 参照偏差过大: {worst:?}");
@@ -687,8 +908,18 @@ mod diagnostics {
 
         let state: Vec<f32> = read("state.bin");
         let image = std::fs::read(dir.join("image_hwc.bin")).unwrap();
-        let policy = ActPolicy::load(&ckpt).unwrap();
-        let (state_t, image_t) = policy.preprocess(&state, &image);
+        let (policy, pre, _) = load_checkpoint(&ckpt).unwrap();
+        let mut batch = normalized_input(&policy, &pre, &state, &image).unwrap();
+        let state_t = batch
+            .take("observation.state")
+            .unwrap()
+            .into_float2()
+            .unwrap();
+        let image_t = batch
+            .take("observation.images.top")
+            .unwrap()
+            .into_float4()
+            .unwrap();
 
         let feat = policy.model.backbone.forward(image_t.clone());
         let [_, _, fh, fw] = feat.dims();
@@ -737,19 +968,19 @@ mod diagnostics {
             .collect();
         let image = std::fs::read(dir.join("image_hwc.bin")).unwrap();
 
-        let policy = ActPolicy::load(&ckpt).unwrap();
+        let (policy, pre, post) = load_checkpoint(&ckpt).unwrap();
         let started = std::time::Instant::now();
-        let warm = policy.run(&state, &image);
+        let warm = canonical_actions(&policy, &pre, &post, &state, &image).unwrap();
         println!("first forward = {:?}（含后端预热）", started.elapsed());
         let started = std::time::Instant::now();
         for _ in 0..N {
-            policy.run(&state, &image);
+            canonical_actions(&policy, &pre, &post, &state, &image).unwrap();
         }
         println!(
             "steady forward = {:?}（{} 次均值，输出与首次一致={:?}）",
             started.elapsed() / N,
             N,
-            policy.run(&state, &image) == warm
+            canonical_actions(&policy, &pre, &post, &state, &image).unwrap() == warm
         );
     }
 }

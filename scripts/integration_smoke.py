@@ -1,6 +1,6 @@
 """无硬件 echo 冒烟：真实 lerobot RemoteClient ↔ pneuma Rust 服务端。
 
-前置：`cargo run -- --config=examples/so101.toml` 启动 echo 服务端。
+前置：`cargo run -- serve --config=examples/so101.toml` 启动 echo 服务端。
 客户端对齐官方 main @ f9e9d739e；ACT 数值验收使用独立脚本。
 
 运行：.venv/bin/python scripts/integration_smoke.py

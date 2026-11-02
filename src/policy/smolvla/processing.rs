@@ -1,34 +1,30 @@
-//! 本地 tokenizer、checkpoint processor 契约及与上游一致的数值预处理。
+//! 将严格校验的 LeRobot checkpoint processor 导入通用 pipeline。
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::{Component, Path},
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use burn::prelude::{Device, Tensor, TensorData};
 use safetensors::{Dtype, SafeTensors};
 use serde::Deserialize;
 use serde_json::Value;
-use tokenizers::{
-    PaddingDirection, PaddingParams, PaddingStrategy, Tokenizer, TruncationDirection,
-    TruncationParams,
-};
 
 use super::config::{PolicyFeature, SmolVlaConfig};
-use crate::protocol::FeatureSpec;
+use crate::contract::FeatureSpec;
+use crate::processor::{DType, Field, Layout, Pipeline, Schema, Step};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Pipeline {
+struct ImportedPipeline {
     #[serde(rename = "name")]
     _name: String,
-    steps: Vec<Step>,
+    steps: Vec<ImportedStep>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Step {
+struct ImportedStep {
     registry_name: String,
     config: Value,
     state_file: Option<String>,
@@ -75,169 +71,186 @@ enum Normalization {
 }
 
 impl Normalization {
-    fn normalize(&self, value: f32, index: usize) -> f32 {
+    /// 导入时展开为通用算术步骤，保留官方公式的运算顺序。
+    fn steps(&self, key: &str, axis: usize, inverse: bool) -> Vec<Step> {
+        let affine = |offset, scale| Step::Affine {
+            key: key.into(),
+            offset,
+            scale,
+            axis,
+        };
+        let linear = |offset, scale| Step::Linear {
+            key: key.into(),
+            offset,
+            scale,
+            axis,
+        };
         match self {
-            Self::Identity => value,
-            Self::MeanStd { mean, std, eps } => (value - mean[index]) / (std[index] + eps),
-            Self::Range { low, span } => 2.0 * (value - low[index]) / span[index] - 1.0,
-        }
-    }
-    fn unnormalize(&self, value: f32, index: usize) -> f32 {
-        match self {
-            Self::Identity => value,
-            // 官方反归一化不加 eps，因此不是 normalize 的严格数学逆。
-            Self::MeanStd { mean, std, .. } => value * std[index] + mean[index],
-            Self::Range { low, span } => (value + 1.0) / 2.0 * span[index] + low[index],
-        }
-    }
-}
-
-/// 加载时检查所有可支持语义，运行时只处理已验证的向量和 RGB 数据。
-#[derive(Debug)]
-pub(super) struct Processor {
-    tokenizer: Tokenizer,
-    state_norm: Normalization,
-    action_norm: Normalization,
-    state_dim: usize,
-    max_state_dim: usize,
-    action_dim: usize,
-    resize: Option<[usize; 2]>,
-}
-
-impl Processor {
-    /// 从 checkpoint 的两条 pipeline 和本地 tokenizer 目录加载，错误均在启动阶段报告。
-    pub fn load(dir: &Path, cfg: &SmolVlaConfig, tokenizer_dir: &Path) -> Result<Self> {
-        let pre = load_pipeline(
-            &dir.join("policy_preprocessor.json"),
-            &[
-                "rename_observations_processor",
-                "to_batch_processor",
-                "smolvla_new_line_processor",
-                "tokenizer_processor",
-                "device_processor",
-                "normalizer_processor",
+            Self::Identity => Vec::new(),
+            Self::MeanStd { mean, std, eps } if !inverse => vec![affine(
+                mean.clone(),
+                std.iter().map(|value| value + eps).collect(),
+            )],
+            // 官方 inverse 不加 eps，且 std=0 合法。
+            Self::MeanStd { mean, std, .. } => vec![linear(mean.clone(), std.clone())],
+            Self::Range { low, span } if !inverse => vec![
+                affine(low.clone(), span.clone()),
+                linear(vec![-1.0], vec![2.0]),
             ],
-        )?;
-        let post = load_pipeline(
-            &dir.join("policy_postprocessor.json"),
-            &["unnormalizer_processor", "device_processor"],
-        )?;
-        // 先验证统计形状，防止错误 checkpoint 被后续 pad 或切片掩盖。
-        let pre_norms = load_normalizers(dir, &pre.steps[5], cfg, false)?;
-        let post_norms = load_normalizers(dir, &post.steps[0], cfg, true)?;
-        validate_steps(&pre, &post)?;
-        let token_config: TokenizerConfig = serde_json::from_value(pre.steps[3].config.clone())
-            .context("parsing tokenizer_processor config")?;
-        ensure!(
-            token_config.task_key == "task",
-            "unsupported tokenizer task_key={}",
-            token_config.task_key
-        );
-        ensure!(
-            token_config.padding_side == "right",
-            "tokenizer requires right padding"
-        );
-        ensure!(
-            token_config.truncation,
-            "tokenizer requires truncation=true"
-        );
-        ensure!(
-            token_config.max_length == cfg.tokenizer_max_length
-                && token_config.padding == cfg.pad_language_to,
-            "tokenizer processor disagrees with tokenizer_max_length/pad_language_to in config.json"
-        );
-        let tokenizer = load_tokenizer(tokenizer_dir, &token_config)?;
-        Ok(Self {
-            tokenizer,
-            state_norm: pre_norms
-                .get("observation.state")
-                .context("missing state normalizer")?
-                .clone(),
-            action_norm: post_norms
-                .get("action")
-                .context("missing action unnormalizer")?
-                .clone(),
-            state_dim: cfg.state_dim(),
-            max_state_dim: cfg.max_state_dim,
-            action_dim: cfg.action_dim(),
-            resize: cfg.resize_imgs_with_padding,
-        })
-    }
-
-    /// 任务只在缺少末尾换行时补一次；返回单样本的 token 与有效位置 mask。
-    pub fn tokenize(&self, task: &str) -> Result<(Vec<i64>, Vec<bool>)> {
-        let task = newline_task(task);
-        let encoded = self
-            .tokenizer
-            .encode(task.as_ref(), true)
-            .map_err(|e| anyhow::anyhow!("tokenizing task: {e}"))?;
-        Ok((
-            encoded.get_ids().iter().map(|&id| i64::from(id)).collect(),
-            encoded
-                .get_attention_mask()
-                .iter()
-                .map(|&mask| mask != 0)
-                .collect(),
-        ))
-    }
-
-    /// 按真实 state 维度归一化，再在右侧补零到模型输入维度。
-    ///
-    /// # Panics
-    /// 调用方必须先按合约验证输入长度。
-    pub fn state(&self, data: &[f32], device: &Device) -> Tensor<2> {
-        assert_eq!(
-            data.len(),
-            self.state_dim,
-            "state input length must match validated dimension {}",
-            self.state_dim
-        );
-        let mut padded = vec![0.0; self.max_state_dim];
-        for (i, &value) in data.iter().enumerate() {
-            padded[i] = self.state_norm.normalize(value, i);
+            Self::Range { low, span } => vec![
+                linear(vec![1.0], vec![1.0]),
+                affine(vec![0.0], vec![2.0]),
+                linear(low.clone(), span.clone()),
+            ],
         }
-        Tensor::from_data(TensorData::new(padded, [1, self.max_state_dim]), device)
     }
+}
 
-    /// 输入为 uint8 HWC；输出为 [1,3,H,W]，适用于 SigLIP 的 [-1,1] 视觉输入。
-    ///
-    /// # Panics
-    /// 调用方必须验证图像长度、非零尺寸和尺寸乘积。
-    pub fn image(&self, data: &[u8], h: usize, w: usize, device: &Device) -> Tensor<4> {
-        let (pixels, height, width) = resize_with_pad(data, h, w, self.resize);
-        Tensor::from_data(TensorData::new(pixels, [1, 3, height, width]), device)
-    }
+/// 只在导入阶段解释 LeRobot 配置，运行时复用通用步骤。
+pub(super) fn import_pipelines(
+    dir: &Path,
+    cfg: &SmolVlaConfig,
+    tokenizer_dir: &Path,
+) -> Result<(Pipeline, Pipeline)> {
+    let pre = load_pipeline(
+        &dir.join("policy_preprocessor.json"),
+        &[
+            "rename_observations_processor",
+            "to_batch_processor",
+            "smolvla_new_line_processor",
+            "tokenizer_processor",
+            "device_processor",
+            "normalizer_processor",
+        ],
+    )?;
+    let post = load_pipeline(
+        &dir.join("policy_postprocessor.json"),
+        &["unnormalizer_processor", "device_processor"],
+    )?;
+    // 先检查统计形状，避免 pad/crop 掩盖 state6/stats8 等错误。
+    let pre_norms = load_normalizers(dir, &pre.steps[5], cfg, false)?;
+    let post_norms = load_normalizers(dir, &post.steps[0], cfg, true)?;
+    validate_steps(&pre, &post)?;
+    let token_config: TokenizerConfig = serde_json::from_value(pre.steps[3].config.clone())
+        .context("parsing tokenizer_processor config")?;
+    ensure!(
+        token_config.task_key == "task",
+        "unsupported tokenizer task_key={}",
+        token_config.task_key
+    );
+    ensure!(
+        token_config.padding_side == "right",
+        "tokenizer requires right padding"
+    );
+    ensure!(
+        token_config.truncation,
+        "tokenizer requires truncation=true"
+    );
+    ensure!(
+        token_config.max_length == cfg.tokenizer_max_length
+            && token_config.padding == cfg.pad_language_to,
+        "tokenizer processor disagrees with tokenizer_max_length/pad_language_to in config.json"
+    );
 
-    /// 输入按 action_dim 连续排列，父模块须先从模型 max_action_dim 中取出真实动作维度。
-    ///
-    /// # Panics
-    /// 输入长度必须为 action_dim 的整数倍。
-    pub fn unnormalize(&self, data: &[f32]) -> Vec<f32> {
-        assert!(
-            data.len().is_multiple_of(self.action_dim),
-            "action input length {} must be divisible by {}",
-            data.len(),
-            self.action_dim
+    let mut schema = Schema::new();
+    schema.insert(
+        "observation.state".into(),
+        Field {
+            shape: vec![Some(cfg.state_dim())],
+            dtype: DType::F32,
+            layout: Layout::Flat,
+            optional: false,
+        },
+    );
+    let mut steps = vec![Step::Batch];
+    for (name, feature) in cfg.image_features() {
+        let (h, w) = (feature.shape[1], feature.shape[2]);
+        schema.insert(
+            name.into(),
+            Field {
+                shape: vec![Some(h), Some(w), Some(3)],
+                dtype: DType::U8,
+                layout: Layout::Hwc,
+                optional: false,
+            },
         );
-        data.iter()
-            .enumerate()
-            .map(|(i, &value)| self.action_norm.unnormalize(value, i % self.action_dim))
-            .collect()
+        steps.push(Step::Rgb { key: name.into() });
+        if let Some([width, height]) = cfg.resize_imgs_with_padding {
+            steps.push(Step::ResizePad {
+                key: name.into(),
+                width,
+                height,
+            });
+        }
+        steps.push(Step::Affine {
+            key: name.into(),
+            offset: vec![0.5],
+            scale: vec![0.5],
+            axis: 1,
+        });
     }
+    schema.insert(
+        "action".into(),
+        Field {
+            shape: vec![Some(cfg.chunk_size), Some(cfg.action_dim())],
+            dtype: DType::F32,
+            layout: Layout::Flat,
+            optional: true,
+        },
+    );
+    steps.extend([
+        Step::Newline,
+        Step::Tokenize {
+            tokenizer: tokenizer_dir.to_path_buf(),
+            max_length: token_config.max_length,
+            padding: token_config.padding,
+            padding_side: token_config.padding_side,
+        },
+    ]);
+    for (key, axis, width) in [
+        ("observation.state", 1, cfg.max_state_dim),
+        ("action", 2, cfg.max_action_dim),
+    ] {
+        steps.extend(
+            pre_norms
+                .get(key)
+                .with_context(|| format!("missing {key} normalizer"))?
+                .steps(key, axis, false),
+        );
+        steps.push(Step::Pad {
+            key: key.into(),
+            width,
+        });
+    }
+    steps.push(Step::Device);
+    let input = Pipeline::new(schema, steps)?;
+    let output_schema = BTreeMap::from([(
+        "action".into(),
+        Field {
+            shape: vec![None, Some(cfg.chunk_size), Some(cfg.max_action_dim)],
+            dtype: DType::F32,
+            layout: Layout::Flat,
+            optional: false,
+        },
+    )]);
+    let mut output_steps = vec![Step::Crop {
+        key: "action".into(),
+        width: cfg.action_dim(),
+    }];
+    output_steps.extend(
+        post_norms
+            .get("action")
+            .context("missing action unnormalizer")?
+            .steps("action", 2, true),
+    );
+    let output = Pipeline::new(output_schema, output_steps)?;
+    Ok((input, output))
 }
 
-fn newline_task(task: &str) -> std::borrow::Cow<'_, str> {
-    if task.ends_with('\n') {
-        task.into()
-    } else {
-        format!("{task}\n").into()
-    }
-}
-
-fn load_pipeline(path: &Path, expected: &[&str]) -> Result<Pipeline> {
+fn load_pipeline(path: &Path, expected: &[&str]) -> Result<ImportedPipeline> {
     let bytes =
         std::fs::read(path).with_context(|| format!("reading processor {}", path.display()))?;
-    let pipeline: Pipeline = serde_json::from_slice(&bytes)
+    let pipeline: ImportedPipeline = serde_json::from_slice(&bytes)
         .with_context(|| format!("parsing processor {}", path.display()))?;
     let names: Vec<_> = pipeline
         .steps
@@ -268,7 +281,7 @@ fn load_pipeline(path: &Path, expected: &[&str]) -> Result<Pipeline> {
     Ok(pipeline)
 }
 
-fn validate_steps(pre: &Pipeline, post: &Pipeline) -> Result<()> {
+fn validate_steps(pre: &ImportedPipeline, post: &ImportedPipeline) -> Result<()> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct RenameConfig {
@@ -320,65 +333,9 @@ fn validate_steps(pre: &Pipeline, post: &Pipeline) -> Result<()> {
     Ok(())
 }
 
-fn load_tokenizer(dir: &Path, config: &TokenizerConfig) -> Result<Tokenizer> {
-    let config_path = dir.join("tokenizer_config.json");
-    let metadata: Value = serde_json::from_slice(
-        &std::fs::read(&config_path)
-            .with_context(|| format!("reading {}", config_path.display()))?,
-    )
-    .context("parsing tokenizer_config.json")?;
-    let mut tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
-        .map_err(|e| anyhow::anyhow!("loading local tokenizer {}: {e}", dir.display()))?;
-    let pad_token = metadata
-        .get("pad_token")
-        .and_then(|v| {
-            v.as_str()
-                .or_else(|| v.get("content").and_then(Value::as_str))
-        })
-        .context("tokenizer_config.json must define pad_token")?;
-    let pad_id = tokenizer
-        .token_to_id(pad_token)
-        .with_context(|| format!("pad_token {pad_token:?} missing from tokenizer vocabulary"))?;
-    if let Some(explicit_id) = metadata.get("pad_token_id") {
-        ensure!(
-            explicit_id.as_u64() == Some(u64::from(pad_id)),
-            "tokenizer pad_token_id disagrees with pad_token vocabulary ID"
-        );
-    }
-    let direction = match metadata
-        .get("truncation_side")
-        .and_then(Value::as_str)
-        .unwrap_or("right")
-    {
-        "right" => TruncationDirection::Right,
-        "left" => TruncationDirection::Left,
-        other => bail!("unsupported tokenizer truncation_side={other}"),
-    };
-    tokenizer
-        .with_truncation(Some(TruncationParams {
-            max_length: config.max_length,
-            direction,
-            ..Default::default()
-        }))
-        .map_err(|e| anyhow::anyhow!("configuring tokenizer truncation: {e}"))?;
-    let strategy = match config.padding.as_str() {
-        "max_length" => PaddingStrategy::Fixed(config.max_length),
-        "longest" => PaddingStrategy::BatchLongest,
-        other => bail!("unsupported tokenizer padding={other}"),
-    };
-    tokenizer.with_padding(Some(PaddingParams {
-        strategy,
-        direction: PaddingDirection::Right,
-        pad_id,
-        pad_token: pad_token.into(),
-        ..Default::default()
-    }));
-    Ok(tokenizer)
-}
-
 fn load_normalizers(
     dir: &Path,
-    step: &Step,
+    step: &ImportedStep,
     cfg: &SmolVlaConfig,
     inverse: bool,
 ) -> Result<HashMap<String, Normalization>> {
@@ -539,67 +496,6 @@ fn load_normalizers(
     Ok(normalizers)
 }
 
-/// 对齐上游 F.interpolate(..., bilinear, align_corners=false)，补零只在左侧和顶部。
-fn resize_with_pad(
-    data: &[u8],
-    h: usize,
-    w: usize,
-    resize: Option<[usize; 2]>,
-) -> (Vec<f32>, usize, usize) {
-    assert!(
-        h > 0 && w > 0,
-        "RGB dimensions must be positive, got {h}x{w}"
-    );
-    assert_eq!(
-        Some(data.len()),
-        h.checked_mul(w).and_then(|v| v.checked_mul(3)),
-        "RGB byte length does not match {h}x{w}x3"
-    );
-    let [width, height] = resize.unwrap_or([w, h]);
-    assert!(
-        width > 0 && height > 0,
-        "resize dimensions must be positive"
-    );
-    let output_len = height
-        .checked_mul(width)
-        .and_then(|v| v.checked_mul(3))
-        .expect("validated RGB output dimensions must not overflow");
-    let ratio = (w as f64 / width as f64).max(h as f64 / height as f64);
-    let rh = (h as f64 / ratio) as usize;
-    let rw = (w as f64 / ratio) as usize;
-    assert!(
-        rh > 0 && rw > 0,
-        "aspect ratio produces an empty resized image: {h}x{w} -> {height}x{width}"
-    );
-    let pad_h = height - rh;
-    let pad_w = width - rw;
-    let coordinates = |size: usize, resized: usize| -> Vec<(usize, usize, f32)> {
-        let scale = (size as f64 / resized as f64) as f32;
-        (0..resized)
-            .map(|i| {
-                let position = (scale * (i as f32 + 0.5) - 0.5).max(0.0);
-                let first = position as usize;
-                (first, (first + 1).min(size - 1), position - first as f32)
-            })
-            .collect()
-    };
-    let ys = coordinates(h, rh);
-    let xs = coordinates(w, rw);
-    let mut out = vec![-1.0; output_len];
-    for channel in 0..3 {
-        for (y, &(y0, y1, wy)) in ys.iter().enumerate() {
-            for (x, &(x0, x1, wx)) in xs.iter().enumerate() {
-                let pixel = |yy, xx| f32::from(data[(yy * w + xx) * 3 + channel]) * (1.0 / 255.0);
-                let top = (1.0 - wx) * pixel(y0, x0) + wx * pixel(y0, x1);
-                let bottom = (1.0 - wx) * pixel(y1, x0) + wx * pixel(y1, x1);
-                let value = (1.0 - wy) * top + wy * bottom;
-                out[(channel * height + y + pad_h) * width + x + pad_w] = value * 2.0 - 1.0;
-            }
-        }
-    }
-    (out, height, width)
-}
-
 /// 部署使用 checkpoint 的特征名；图像在线协议为 HWC，checkpoint 为 CHW。
 pub(super) fn validate_contract(
     cfg: &SmolVlaConfig,
@@ -653,24 +549,93 @@ pub(super) fn validate_contract(
 mod tests {
     use super::*;
 
+    use crate::processor::{Batch, Context, Data, Mode};
+    use burn::tensor::{Device, Tensor, TensorData};
+
+    fn context() -> Context {
+        Context {
+            device: Device::flex(),
+            mode: Mode::Eval,
+        }
+    }
+
+    fn prepare_image(data: Vec<u8>, h: usize, w: usize, width: usize, height: usize) -> Vec<f32> {
+        let schema = BTreeMap::from([(
+            "image".into(),
+            Field {
+                shape: vec![Some(h), Some(w), Some(3)],
+                dtype: DType::U8,
+                layout: Layout::Hwc,
+                optional: false,
+            },
+        )]);
+        let pipeline = Pipeline::new(
+            schema,
+            vec![
+                Step::Batch,
+                Step::Rgb {
+                    key: "image".into(),
+                },
+                Step::ResizePad {
+                    key: "image".into(),
+                    width,
+                    height,
+                },
+                Step::Affine {
+                    key: "image".into(),
+                    offset: vec![0.5],
+                    scale: vec![0.5],
+                    axis: 1,
+                },
+                Step::Device,
+            ],
+        )
+        .unwrap();
+        let mut batch = Batch::default();
+        batch.values.insert(
+            "image".into(),
+            Data::U8 {
+                values: data,
+                shape: vec![h, w, 3],
+            },
+        );
+        pipeline
+            .run(batch, &context())
+            .unwrap()
+            .take("image")
+            .unwrap()
+            .into_float4()
+            .unwrap()
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap()
+    }
+
     #[test]
     fn newline_is_idempotent_and_preserves_existing_newlines() {
-        assert_eq!(newline_task("pick"), "pick\n");
-        assert_eq!(newline_task("pick\n"), "pick\n");
-        assert_eq!(newline_task("pick\n\n"), "pick\n\n");
+        let pipeline = Pipeline::new(Schema::new(), vec![Step::Newline]).unwrap();
+        for (task, expected) in [
+            ("pick", "pick\n"),
+            ("pick\n", "pick\n"),
+            ("pick\n\n", "pick\n\n"),
+        ] {
+            let batch = Batch {
+                tasks: vec![task.into()],
+                ..Batch::default()
+            };
+            assert_eq!(pipeline.run(batch, &context()).unwrap().tasks, [expected]);
+        }
     }
 
     #[test]
     fn bilinear_uses_half_pixels_and_top_left_padding() {
-        let data = [0, 0, 0, 255, 255, 255];
-        let (pixels, h, w) = resize_with_pad(&data, 1, 2, Some([4, 4]));
-        assert_eq!((h, w), (4, 4));
+        let pixels = prepare_image(vec![0, 0, 0, 255, 255, 255], 1, 2, 4, 4);
         for channel in pixels.as_chunks::<16>().0 {
             assert_eq!(&channel[..8], &[-1.0; 8]);
             assert_eq!(&channel[8..12], &[-1.0, -0.5, 0.5, 1.0]);
             assert_eq!(&channel[12..], &[-1.0, -0.5, 0.5, 1.0]);
         }
-        let (pixels, _, _) = resize_with_pad(&[255; 6], 2, 1, Some([4, 2]));
+        let pixels = prepare_image(vec![255; 6], 2, 1, 4, 2);
         assert_eq!(
             &pixels[..8],
             &[-1.0, -1.0, -1.0, 1.0, -1.0, -1.0, -1.0, 1.0]
@@ -679,8 +644,8 @@ mod tests {
 
     #[test]
     fn non_integer_resize_matches_torch_211() {
-        let data: Vec<u8> = (0..45).map(|i| ((i * 37 + 11) % 256) as u8).collect();
-        let (pixels, _, _) = resize_with_pad(&data, 3, 5, Some([4, 6]));
+        let data = (0..45).map(|i| ((i * 37 + 11) % 256) as u8).collect();
+        let pixels = prepare_image(data, 3, 5, 4, 6);
         // torch 2.11 interpolate(size=(2,4), align_corners=False)，顶部补四行。
         let expected = [
             -0.7205882,
@@ -708,6 +673,13 @@ mod tests {
     }
     impl Fixture {
         fn new(state_stats_dim: usize) -> (Self, SmolVlaConfig) {
+            Self::with_std(state_stats_dim, 2.0, [2.0, 4.0])
+        }
+        fn with_std(
+            state_stats_dim: usize,
+            state_std_value: f32,
+            action_std_values: [f32; 2],
+        ) -> (Self, SmolVlaConfig) {
             use safetensors::tensor::TensorView;
             use tokenizers::{
                 models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace,
@@ -743,7 +715,7 @@ mod tests {
                 .into_iter()
                 .flat_map(f32::to_le_bytes)
                 .collect::<Vec<_>>();
-            let state_std = vec![2.0f32; state_stats_dim]
+            let state_std = vec![state_std_value; state_stats_dim]
                 .into_iter()
                 .flat_map(f32::to_le_bytes)
                 .collect::<Vec<_>>();
@@ -751,7 +723,7 @@ mod tests {
                 .into_iter()
                 .flat_map(f32::to_le_bytes)
                 .collect::<Vec<_>>();
-            let action_std = [2.0f32, 4.0]
+            let action_std = action_std_values
                 .into_iter()
                 .flat_map(f32::to_le_bytes)
                 .collect::<Vec<_>>();
@@ -794,7 +766,7 @@ mod tests {
                 )
                 .build()
                 .unwrap();
-            let mut tokenizer = Tokenizer::new(model);
+            let mut tokenizer = tokenizers::Tokenizer::new(model);
             tokenizer.with_pre_tokenizer(Some(Whitespace));
             tokenizer
                 .save(fixture.0.join("tokenizer.json"), false)
@@ -805,6 +777,37 @@ mod tests {
             );
             (fixture, cfg)
         }
+        fn batch(&self, task: &str, targets: Option<Vec<f32>>) -> Batch {
+            let mut batch = Batch {
+                values: BTreeMap::from([
+                    (
+                        "observation.state".into(),
+                        Data::F32 {
+                            values: vec![3.0; 6],
+                            shape: vec![6],
+                        },
+                    ),
+                    (
+                        "observation.images.camera".into(),
+                        Data::U8 {
+                            values: vec![0; 45],
+                            shape: vec![3, 5, 3],
+                        },
+                    ),
+                ]),
+                tasks: vec![task.into()],
+            };
+            if let Some(values) = targets {
+                batch.values.insert(
+                    "action".into(),
+                    Data::F32 {
+                        shape: vec![values.len() / 2, 2],
+                        values,
+                    },
+                );
+            }
+            batch
+        }
         fn write(&self, name: &str, value: &Value) {
             std::fs::write(self.0.join(name), serde_json::to_vec(value).unwrap()).unwrap();
         }
@@ -813,29 +816,93 @@ mod tests {
     #[test]
     fn pipeline_loads_local_tokenizer_normalizes_then_pads() {
         let (fixture, cfg) = Fixture::new(6);
-        let processor = Processor::load(&fixture.0, &cfg, &fixture.0).unwrap();
+        let (pre, post) = import_pipelines(&fixture.0, &cfg, &fixture.0).unwrap();
+        let mut batch = pre.run(fixture.batch("a b", None), &context()).unwrap();
+        let tokens = match batch.take("observation.language.tokens").unwrap() {
+            Data::Int2(tokens) => tokens.into_data().iter::<i64>().collect::<Vec<_>>(),
+            other => panic!("expected integer tokens, got {other:?}"),
+        };
+        let mask = match batch.take("observation.language.attention_mask").unwrap() {
+            Data::Bool2(mask) => mask.into_data().try_to_vec::<bool>().unwrap(),
+            other => panic!("expected boolean mask, got {other:?}"),
+        };
+        assert_eq!(tokens, [1, 2, 7, 7]);
+        assert_eq!(mask, [true, true, false, false]);
+        let mut truncated = pre
+            .run(fixture.batch("a b c d e", None), &context())
+            .unwrap();
+        let Data::Int2(tokens) = truncated.take("observation.language.tokens").unwrap() else {
+            panic!("expected integer tokens");
+        };
         assert_eq!(
-            processor.tokenize("a b").unwrap(),
-            (vec![1, 2, 7, 7], vec![true, true, false, false])
+            tokens.into_data().iter::<i64>().collect::<Vec<_>>(),
+            [2, 3, 4, 5]
         );
-        assert_eq!(processor.tokenize("a b c d e").unwrap().0, vec![2, 3, 4, 5]);
-        let state = processor
-            .state(&[3.0; 6], &Device::flex())
+        let state = batch
+            .take("observation.state")
+            .unwrap()
+            .into_float2()
+            .unwrap()
             .into_data()
             .try_to_vec::<f32>()
             .unwrap();
         assert_eq!(&state[..6], &[1.0; 6]);
         assert_eq!(&state[6..], &[0.0; 26]);
+        assert!(
+            !batch.values.contains_key("action"),
+            "inference must not require training targets"
+        );
+
+        let targets = [12.0, 28.0].repeat(cfg.chunk_size);
+        let mut train_context = context();
+        train_context.mode = Mode::Train;
+        let mut training = pre
+            .run(fixture.batch("a", Some(targets)), &train_context)
+            .unwrap();
+        let action = training.take("action").unwrap().into_float3().unwrap();
+        assert_eq!(action.dims(), [1, cfg.chunk_size, cfg.max_action_dim]);
+        for row in action
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap()
+            .chunks_exact(cfg.max_action_dim)
+        {
+            assert_eq!(&row[..2], &[1.0, 2.0]);
+            assert!(row[2..].iter().all(|&value| value == 0.0));
+        }
+        let mut padded = vec![999.0; cfg.chunk_size * cfg.max_action_dim];
+        for (index, row) in padded.chunks_exact_mut(cfg.max_action_dim).enumerate() {
+            let sign = if index % 2 == 0 { 1.0 } else { -1.0 };
+            row[..2].copy_from_slice(&[sign, 2.0 * sign]);
+        }
+        let output = Batch {
+            values: BTreeMap::from([(
+                "action".into(),
+                Data::Float3(Tensor::from_data(
+                    TensorData::new(padded, [1, cfg.chunk_size, cfg.max_action_dim]),
+                    &context().device,
+                )),
+            )]),
+            ..Batch::default()
+        };
+        let action = post
+            .run(output, &context())
+            .unwrap()
+            .take("action")
+            .unwrap()
+            .into_float3()
+            .unwrap();
+        assert_eq!(action.dims(), [1, cfg.chunk_size, 2]);
         assert_eq!(
-            processor.unnormalize(&[1.0, 2.0, -1.0, -2.0]),
-            vec![12.0, 28.0, 8.0, 12.0]
+            &action.into_data().try_to_vec::<f32>().unwrap()[..4],
+            &[12.0, 28.0, 8.0, 12.0]
         );
     }
 
     #[test]
     fn state_six_stats_eight_is_rejected_during_load() {
         let (fixture, cfg) = Fixture::new(8);
-        let error = Processor::load(&fixture.0, &cfg, &fixture.0).unwrap_err();
+        let error = import_pipelines(&fixture.0, &cfg, &fixture.0).unwrap_err();
         let message = format!("{error:#}");
         assert!(
             message.contains("observation.state.")
@@ -853,7 +920,7 @@ mod tests {
         value["steps"][0]["config"]["rename_map"] = serde_json::json!({"old":"new"});
         fixture.write("policy_preprocessor.json", &value);
         assert!(
-            Processor::load(&fixture.0, &cfg, &fixture.0)
+            import_pipelines(&fixture.0, &cfg, &fixture.0)
                 .unwrap_err()
                 .to_string()
                 .contains("rename_map")
@@ -861,7 +928,7 @@ mod tests {
         value["steps"][2]["registry_name"] = "custom_processor".into();
         fixture.write("policy_preprocessor.json", &value);
         assert!(
-            Processor::load(&fixture.0, &cfg, &fixture.0)
+            import_pipelines(&fixture.0, &cfg, &fixture.0)
                 .unwrap_err()
                 .to_string()
                 .contains("custom_processor")
@@ -869,19 +936,121 @@ mod tests {
     }
 
     #[test]
+    fn range_normalization_and_inverse_keep_canonical_midpoints() {
+        let (fixture, mut cfg) = Fixture::with_std(6, 5.0, [14.0, 28.0]);
+        for kind in ["STATE", "ACTION"] {
+            cfg.normalization_mapping
+                .insert(kind.into(), "MIN_MAX".into());
+        }
+        for (filename, index) in [
+            ("policy_preprocessor.json", 5),
+            ("policy_postprocessor.json", 0),
+        ] {
+            let mut value: Value =
+                serde_json::from_slice(&std::fs::read(fixture.0.join(filename)).unwrap()).unwrap();
+            for kind in ["STATE", "ACTION"] {
+                value["steps"][index]["config"]["norm_map"][kind] = "MIN_MAX".into();
+            }
+            fixture.write(filename, &value);
+        }
+        let stats = std::fs::read(fixture.0.join("stats.safetensors")).unwrap();
+        let tensors = SafeTensors::deserialize(&stats).unwrap();
+        let ranges = tensors.tensors().into_iter().map(|(name, tensor)| {
+            (
+                name.replace(".mean", ".min").replace(".std", ".max"),
+                tensor,
+            )
+        });
+        std::fs::write(
+            fixture.0.join("stats.safetensors"),
+            safetensors::tensor::serialize(ranges, None).unwrap(),
+        )
+        .unwrap();
+        let (pre, post) = import_pipelines(&fixture.0, &cfg, &fixture.0).unwrap();
+        let mut prepared = pre
+            .run(
+                fixture.batch("a", Some([12.0, 24.0].repeat(cfg.chunk_size))),
+                &context(),
+            )
+            .unwrap();
+        let state = prepared
+            .take("observation.state")
+            .unwrap()
+            .into_float2()
+            .unwrap()
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap();
+        assert_eq!(state, vec![0.0; cfg.max_state_dim]);
+        let action = prepared.take("action").unwrap().into_float3().unwrap();
+        assert!(
+            action
+                .clone()
+                .into_data()
+                .try_to_vec::<f32>()
+                .unwrap()
+                .iter()
+                .all(|&value| value == 0.0)
+        );
+        let output = Batch {
+            values: BTreeMap::from([("action".into(), Data::Float3(action))]),
+            ..Batch::default()
+        };
+        let canonical = post
+            .run(output, &context())
+            .unwrap()
+            .take("action")
+            .unwrap()
+            .into_float3()
+            .unwrap()
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap();
+        assert_eq!(canonical, [12.0, 24.0].repeat(cfg.chunk_size));
+    }
+
+    #[test]
     fn normalization_matches_official_epsilon_and_inverse() {
-        let norm = Normalization::MeanStd {
-            mean: vec![2.0],
-            std: vec![0.0],
-            eps: 0.25,
+        let (fixture, cfg) = Fixture::with_std(6, 0.0, [0.0, 0.0]);
+        let path = fixture.0.join("policy_preprocessor.json");
+        let mut value: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        value["steps"][5]["config"]["eps"] = 0.25.into();
+        fixture.write("policy_preprocessor.json", &value);
+        let (pre, post) = import_pipelines(&fixture.0, &cfg, &fixture.0).unwrap();
+        let mut batch = pre
+            .run(
+                fixture.batch("a", Some([11.0, 21.0].repeat(cfg.chunk_size))),
+                &context(),
+            )
+            .unwrap();
+        let state = batch
+            .take("observation.state")
+            .unwrap()
+            .into_float2()
+            .unwrap()
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap();
+        assert_eq!(&state[..6], &[8.0; 6]);
+        let action = batch.take("action").unwrap().into_float3().unwrap();
+        assert_eq!(
+            &action.clone().into_data().try_to_vec::<f32>().unwrap()[..2],
+            &[4.0, 4.0]
+        );
+        let output = Batch {
+            values: BTreeMap::from([("action".into(), Data::Float3(action))]),
+            ..Batch::default()
         };
-        assert_eq!(norm.normalize(3.0, 0), 4.0);
-        assert_eq!(norm.unnormalize(4.0, 0), 2.0);
-        let range = Normalization::Range {
-            low: vec![1.0],
-            span: vec![4.0],
-        };
-        assert_eq!(range.normalize(3.0, 0), 0.0);
-        assert_eq!(range.unnormalize(0.0, 0), 3.0);
+        let canonical = post
+            .run(output, &context())
+            .unwrap()
+            .take("action")
+            .unwrap()
+            .into_float3()
+            .unwrap()
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap();
+        assert_eq!(canonical, [10.0, 20.0].repeat(cfg.chunk_size));
     }
 }

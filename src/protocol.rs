@@ -240,29 +240,7 @@ impl Envelope {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct FeatureSpec {
-    pub name: String,
-    pub shape: Vec<u64>,
-    pub dtype: String,
-    pub kind: String,
-    pub names: Vec<String>,
-    pub semantics: String,
-}
-
-impl Default for FeatureSpec {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            shape: Vec::new(),
-            dtype: String::new(),
-            kind: "tensor".to_string(),
-            names: Vec::new(),
-            semantics: String::new(),
-        }
-    }
-}
+use crate::contract::FeatureSpec;
 
 /// 准入前通告的不可变服务合约，字段与 Python `PolicyCapabilities` 的 asdict 对齐。
 #[derive(Clone, Debug, Serialize, Deserialize)]

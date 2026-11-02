@@ -6,8 +6,7 @@ semantics = "libero-end-effector-delta-v1"
 
 [model]
 policy = "smolvla"
-repo_or_path = "/absolute/path/to/consistent/smolvla/checkpoint"
-vlm_path = "/absolute/path/to/SmolVLM2-500M-Video-Instruct"
+repo_or_path = "/absolute/path/to/native/smolvla-checkpoint"
 device = "metal"
 
 [execution]

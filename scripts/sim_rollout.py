@@ -89,6 +89,10 @@ def remote_predict(client, obs):
 
 @contextmanager
 def managed_server(args, backend, checkpoint):
+    native = args.output.parent / f"{args.output.stem}-native"
+    if not native.exists():
+        subprocess.run([str(args.server.resolve()), "convert", "--from=lerobot", "--to=pneuma",
+            f"--input={checkpoint}", f"--output={native}"], cwd=ROOT, check=True)
     # 只持有和终止本次创建的子进程；端口冲突会作为启动失败报告。
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
@@ -97,8 +101,8 @@ def managed_server(args, backend, checkpoint):
     log_path = args.output.parent / f"{args.output.stem}-{backend}.log"
     with log_path.open("w+") as log:
         command = [
-            str(args.server.resolve()), "--config=examples/aloha_sim.toml",
-            f"--checkpoint={checkpoint}", f"--device={backend}",
+            str(args.server.resolve()), "serve", "--config=examples/aloha_sim.toml",
+            f"--checkpoint={native}", f"--device={backend}",
             f"--action-steps={args.action_steps}",
             f"--warmup-calls={args.warmup_calls}",
             f"--listen={endpoint}",

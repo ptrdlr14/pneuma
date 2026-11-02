@@ -17,15 +17,13 @@ use burn::tensor::{DType, Device, Distribution, Int, Tensor, TensorData};
 use burn_store::{
     FloatCastAdapter, ModuleAdapter, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore,
 };
-use rmpv::Value;
 use serde::Deserialize;
 
-use crate::codec;
-use crate::policy::{Chunk, PolicyRunner};
-use crate::protocol::{Capabilities, ErrorCode, ProtocolError, body_get};
+use crate::contract::FeatureSpec;
+use crate::policy::Policy;
+use crate::processor::{Batch, Data, Pipeline};
 
 use config::SmolVlaConfig;
-use processing::Processor;
 use transformer::{ExpertModel, KvCache, TextConfig, TextModel};
 use vision::{Connector, VisionConfig, VisionModel};
 
@@ -206,28 +204,57 @@ impl VLAFlowMatching {
 pub struct SmolVlaPolicy {
     model: VLAFlowMatching,
     cfg: SmolVlaConfig,
-    processor: Processor,
     device: Device,
 }
 
 impl SmolVlaPolicy {
-    pub fn load_configured(
+    pub fn import_configured(
         path: &Path,
         vlm_path: Option<&Path>,
         backend: crate::config::Device,
-        warmup_calls: usize,
-        features: &[crate::protocol::FeatureSpec],
-        action: &crate::protocol::FeatureSpec,
-    ) -> Result<Self> {
+        features: &[FeatureSpec],
+        action: &FeatureSpec,
+    ) -> Result<(Self, Pipeline, Pipeline, Vec<String>)> {
         let cfg = config::parse(&path.join("config.json"))?;
         processing::validate_contract(&cfg, features, action)?;
+        let tokenizer_dir = vlm_path
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| path.join("vlm"));
+        let (preprocessor, postprocessor) =
+            processing::import_pipelines(path, &cfg, &tokenizer_dir)?;
+        let (policy, unused) = Self::import_lerobot(path, vlm_path, backend)?;
+        Ok((policy, preprocessor, postprocessor, unused))
+    }
+
+    /// 严格加载原生模型 record，外部 safetensors 必须先转换。
+    pub fn load_model(
+        path: &Path,
+        vlm_path: Option<&Path>,
+        backend: crate::config::Device,
+    ) -> Result<Self> {
+        let mut policy = Self::init_model(path, vlm_path, backend)?;
+        let record = burn::store::ModuleRecord::load(path.join("model.bpk"))
+            .context("reading native SmolVLA model.bpk; convert the LeRobot checkpoint first")?;
+        policy.model = policy
+            .model
+            .try_load_record(record)
+            .context("restoring SmolVLA model record")?;
+        Ok(policy)
+    }
+
+    fn init_model(
+        path: &Path,
+        vlm_path: Option<&Path>,
+        backend: crate::config::Device,
+    ) -> Result<Self> {
+        let cfg = config::parse(&path.join("config.json"))?;
         let vlm_path = vlm_path
             .map(Path::to_path_buf)
             .unwrap_or_else(|| path.join("vlm"));
-        let mut vlm: VlmConfig = serde_json::from_slice(
-            &std::fs::read(vlm_path.join("config.json"))
-                .context("reading local SmolVLM config; set model.vlm_path or --vlm-path")?,
-        )?;
+        let mut vlm: VlmConfig =
+            serde_json::from_slice(&std::fs::read(vlm_path.join("config.json")).context(
+                "reading local SmolVLM config; provide convert --vlm-path when importing",
+            )?)?;
         vlm.text_config.validate()?;
         let layers = if cfg.num_vlm_layers > 0 {
             cfg.num_vlm_layers as usize
@@ -283,18 +310,28 @@ impl SmolVlaPolicy {
             !cfg.add_image_special_tokens,
             "SmolVLA add_image_special_tokens=true is not supported"
         );
-        let processor = Processor::load(path, &cfg, &vlm_path)?;
         let device = match backend {
             crate::config::Device::Auto => Device::default(),
             crate::config::Device::Flex => Device::flex(),
             crate::config::Device::Metal => Device::metal(Default::default()),
         };
-        let mut model = VLAFlowMatching::init(&cfg, &vlm, &device);
+        let model = VLAFlowMatching::init(&cfg, &vlm, &device);
+        Ok(Self { model, cfg, device })
+    }
+
+    /// 转换边界导入 LeRobot 参数；未使用参数留给 checkpoint 转换器保存。
+    pub fn import_lerobot(
+        path: &Path,
+        vlm_path: Option<&Path>,
+        backend: crate::config::Device,
+    ) -> Result<(Self, Vec<String>)> {
+        let mut policy = Self::init_model(path, vlm_path, backend)?;
         let mut store = SafetensorsStore::from_file(path.join("model.safetensors"))
             .with_from_adapter(PyTorchToBurnAdapter.chain(FloatCastAdapter::to(DType::F32)))
             .with_key_remapping(r"^model\.", "")
             .allow_partial(true);
-        let applied = model
+        let applied = policy
+            .model
             .load_from(&mut store)
             .context("loading SmolVLA weights")?;
         ensure!(
@@ -306,136 +343,83 @@ impl SmolVlaPolicy {
         tracing::info!(
             applied = applied.applied.len(),
             unused = applied.unused.len(),
-            ?device,
-            "SmolVLA weights loaded"
+            device = ?policy.device,
+            "SmolVLA weights imported"
         );
-        let policy = Self {
-            model,
-            cfg,
-            processor,
-            device,
-        };
-        for _ in 0..warmup_calls {
-            let state = vec![0.; policy.cfg.state_dim()];
-            let images: Vec<_> = policy
-                .cfg
-                .image_features()
-                .map(|(_, feature)| {
-                    let [_, h, w] = feature.shape[..] else {
-                        unreachable!("validated image shape")
-                    };
-                    policy
-                        .processor
-                        .image(&vec![0; h * w * 3], h, w, &policy.device)
-                })
-                .collect();
-            let (tokens, valid) = policy.processor.tokenize("")?;
-            let noise = Tensor::zeros(
-                [1, policy.cfg.chunk_size, policy.cfg.max_action_dim],
-                &policy.device,
-            );
-            let values = policy
-                .model
-                .sample(
-                    images,
-                    &tokens,
-                    &valid,
-                    policy.processor.state(&state, &policy.device),
-                    noise,
-                    &policy.cfg,
-                )
-                .into_data()
-                .try_to_vec::<f32>()?;
-            ensure!(
-                values.iter().all(|x| x.is_finite()),
-                "SmolVLA warmup produced non-finite actions"
-            );
-        }
-        Ok(policy)
+        Ok((policy, applied.unused))
+    }
+
+    /// 保存当前模型参数与参数身份，pipeline 由 checkpoint 独立保存。
+    pub fn save_native(&self, path: &Path) -> Result<()> {
+        self.model.clone().into_record().save(path)?;
+        Ok(())
+    }
+
+    /// 导出当前动作预测模块的 LeRobot 参数名及 PyTorch 布局。
+    pub fn export_lerobot(&self, path: &Path) -> Result<()> {
+        let mut store = SafetensorsStore::from_file(path)
+            .with_to_adapter(burn_store::BurnToPyTorchAdapter)
+            .with_key_remapping(r"^", "model.");
+        self.model.save_into(&mut store)?;
+        Ok(())
     }
 
     pub fn horizon(&self) -> (u64, u64) {
         (self.cfg.chunk_size as u64, self.cfg.n_action_steps as u64)
     }
+
+    pub fn device(&self) -> Device {
+        self.device.clone()
+    }
 }
 
-impl PolicyRunner for SmolVlaPolicy {
-    fn validate_against(&self, caps: &Capabilities) -> std::result::Result<(), ProtocolError> {
-        processing::validate_contract(&self.cfg, &caps.features, &caps.action_feature)
-            .map_err(|error| ProtocolError::new(ErrorCode::Incompatible, error.to_string()))
-    }
-
-    fn predict(
-        &self,
-        caps: &Capabilities,
-        features: &Value,
-        task: Option<&str>,
-    ) -> std::result::Result<Chunk, ProtocolError> {
-        let execute = || -> Result<Chunk> {
-            let task = task.context("SmolVLA requires observation task text")?;
-            ensure!(task.chars().count() <= 4096, "task exceeds max_input_chars");
-            let (tokens, valid) = self.processor.tokenize(task)?;
-            let state = codec::decode_record(
-                body_get(features, "observation.state").context("missing state")?,
-            )?;
-            let state: Vec<_> = state
-                .data
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|bytes| f32::from_le_bytes(*bytes))
-                .collect();
-            let mut images = Vec::new();
-            for (name, _) in self.cfg.image_features() {
-                let image = codec::decode_record(
-                    body_get(features, name).with_context(|| format!("missing image {name}"))?,
-                )?;
-                images.push(self.processor.image(
-                    image.data,
-                    image.shape[0] as usize,
-                    image.shape[1] as usize,
-                    &self.device,
-                ));
+impl Policy for SmolVlaPolicy {
+    fn predict(&self, mut batch: Batch) -> Result<Batch> {
+        let state = batch.take("observation.state")?.into_float2()?;
+        ensure!(
+            state.dims() == [1, self.cfg.max_state_dim],
+            "SmolVLA requires one prepared state sample"
+        );
+        let tokens = match batch.take("observation.language.tokens")? {
+            Data::Int2(tokens) => {
+                ensure!(tokens.dims()[0] == 1, "SmolVLA requires one task sample");
+                tokens.into_data().iter::<i64>().collect::<Vec<_>>()
             }
-            let noise = Tensor::random(
-                [1, self.cfg.chunk_size, self.cfg.max_action_dim],
-                Distribution::Normal(0., 1.),
-                &self.device,
-            );
-            let output = self.model.sample(
-                images,
-                &tokens,
-                &valid,
-                self.processor.state(&state, &self.device),
-                noise,
-                &self.cfg,
-            );
-            let flat = output.into_data().try_to_vec::<f32>()?;
-            let steps = usize::try_from(caps.execution_steps)?;
-            ensure!(
-                steps > 0 && steps <= self.cfg.chunk_size,
-                "invalid execution_steps"
-            );
-            let trimmed: Vec<_> = flat
-                .chunks_exact(self.cfg.max_action_dim)
-                .take(steps)
-                .flat_map(|row| row[..self.cfg.action_dim()].iter().copied())
-                .collect();
-            let actions = self.processor.unnormalize(&trimmed);
-            ensure!(
-                actions.iter().all(|x| x.is_finite()),
-                "SmolVLA produced non-finite actions"
-            );
-            Ok(Chunk {
-                canonical_actions: actions.iter().flat_map(|v| v.to_le_bytes()).collect(),
-                execution_steps: caps.execution_steps,
-            })
+            _ => anyhow::bail!("SmolVLA requires prepared integer language tokens"),
         };
-        execute().map_err(|error| {
-            ProtocolError::new(
-                ErrorCode::Execution,
-                format!("SmolVLA inference: {error:#}"),
-            )
+        let valid = match batch.take("observation.language.attention_mask")? {
+            Data::Bool2(mask) => {
+                ensure!(
+                    mask.dims() == [1, tokens.len()],
+                    "SmolVLA language mask shape differs from tokens"
+                );
+                mask.into_data().iter::<bool>().collect::<Vec<_>>()
+            }
+            _ => anyhow::bail!("SmolVLA requires prepared boolean language mask"),
+        };
+        let images = self
+            .cfg
+            .image_features()
+            .map(|(name, _)| {
+                let image = batch.take(name)?.into_float4()?;
+                ensure!(
+                    image.dims()[0] == 1,
+                    "SmolVLA requires one prepared image sample"
+                );
+                Ok(image)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let noise = Tensor::random(
+            [1, self.cfg.chunk_size, self.cfg.max_action_dim],
+            Distribution::Normal(0., 1.),
+            &self.device,
+        );
+        let action = self
+            .model
+            .sample(images, &tokens, &valid, state, noise, &self.cfg);
+        Ok(Batch {
+            values: [("action".into(), Data::Float3(action))].into(),
+            ..Batch::default()
         })
     }
 }

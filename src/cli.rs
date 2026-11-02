@@ -2,14 +2,67 @@
 
 use std::path::PathBuf;
 
-use clap::{Args, Parser, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::config::{Device, Policy, ServerConfig};
 
-/// 完整部署由 TOML 提供，命令行只调整本次启动需要的选项。
+/// 原生策略服务与 LeRobot checkpoint 双向转换。
 #[derive(Debug, Parser)]
-#[command(name = "pneuma", version, about = "LeRobot remote-inference v1 服务端")]
+#[command(name = "pneuma", version, about = "Burn 策略运行时与 checkpoint 转换")]
 pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// 启动原生 bpk checkpoint 服务
+    Serve(ServeArgs),
+    /// 转换 LeRobot 与 Pneuma checkpoint
+    Convert(ConvertArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ConvertArgs {
+    #[arg(long, value_enum)]
+    from: FormatArg,
+    #[arg(long, value_enum)]
+    to: FormatArg,
+    #[arg(long)]
+    input: PathBuf,
+    #[arg(long)]
+    output: PathBuf,
+    /// 导入 SmolVLA 时的本地 VLM 资源
+    #[arg(long)]
+    vlm_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum FormatArg {
+    Lerobot,
+    Pneuma,
+}
+
+impl ConvertArgs {
+    pub fn run(self) -> anyhow::Result<()> {
+        use crate::convert::{ConvertOptions, Format};
+        let format = |value| match value {
+            FormatArg::Lerobot => Format::Lerobot,
+            FormatArg::Pneuma => Format::Pneuma,
+        };
+        crate::convert::run(&ConvertOptions {
+            from: format(self.from),
+            to: format(self.to),
+            input: self.input,
+            output: self.output,
+            vlm_path: self.vlm_path,
+        })
+    }
+}
+
+/// 完整部署由 TOML 提供，命令行只调整本次启动需要的选项。
+#[derive(Debug, Args)]
+pub struct ServeArgs {
     /// 部署 TOML 文件
     #[arg(long)]
     pub config: PathBuf,
@@ -27,9 +80,6 @@ struct ModelArgs {
     /// 本地 checkpoint 目录
     #[arg(long)]
     checkpoint: Option<PathBuf>,
-    /// SmolVLA 本地 VLM 配置与 tokenizer 资源目录
-    #[arg(long)]
-    vlm_path: Option<PathBuf>,
     /// 推理设备
     #[arg(long, value_enum)]
     device: Option<DeviceArg>,
@@ -95,14 +145,11 @@ enum ZenohMode {
     Client,
 }
 
-impl Cli {
+impl ServeArgs {
     /// 只应用显式传入的值，完整配置由服务构造入口统一校验。
     pub fn apply(self, config: &mut ServerConfig) {
         if let Some(path) = self.model.checkpoint {
             config.model.repo_or_path = path;
-        }
-        if let Some(path) = self.model.vlm_path {
-            config.model.vlm_path = Some(path);
         }
         if let Some(device) = self.model.device {
             config.model.device = match device {
@@ -152,13 +199,16 @@ mod tests {
 
     fn load(args: &[&str]) -> ServerConfig {
         let cli = Cli::try_parse_from(
-            ["pneuma", "--config=examples/so101.toml"]
+            ["pneuma", "serve", "--config=examples/so101.toml"]
                 .into_iter()
                 .chain(args.iter().copied()),
         )
         .unwrap();
-        let mut config = ServerConfig::load(&cli.config).unwrap();
-        cli.apply(&mut config);
+        let Command::Serve(args) = cli.command else {
+            panic!("expected serve")
+        };
+        let mut config = ServerConfig::load(&args.config).unwrap();
+        args.apply(&mut config);
         config.validate().unwrap();
         config
     }
@@ -207,23 +257,49 @@ mod tests {
     }
 
     #[test]
-    fn smolvla_options_use_checkpoint_horizon_and_local_vlm_resources() {
+    fn smolvla_options_use_native_checkpoint_horizon() {
         let cli = Cli::try_parse_from([
             "pneuma",
+            "serve",
             "--config=examples/smolvla_libero.toml",
             "--policy=smolvla",
             "--checkpoint=/tmp/policy",
-            "--vlm-path=/tmp/local VLM",
             "--action-steps=10",
         ])
         .unwrap();
-        let mut config = ServerConfig::load(&cli.config).unwrap();
-        cli.apply(&mut config);
+        let Command::Serve(args) = cli.command else {
+            panic!("expected serve")
+        };
+        let mut config = ServerConfig::load(&args.config).unwrap();
+        args.apply(&mut config);
         config.validate().unwrap();
         assert!(matches!(config.model.policy, Policy::Smolvla));
-        assert_eq!(config.model.vlm_path, Some(PathBuf::from("/tmp/local VLM")));
+        assert!(
+            Cli::try_parse_from(["pneuma", "serve", "--config=x", "--vlm-path=external"]).is_err()
+        );
         assert_eq!(config.execution.prediction_steps, None);
         assert_eq!(config.execution.n_action_steps, Some(10));
+    }
+
+    #[test]
+    fn conversion_is_separate_from_serving_and_preserves_paths() {
+        let cli = Cli::try_parse_from([
+            "pneuma",
+            "convert",
+            "--from=lerobot",
+            "--to=pneuma",
+            "--input=source with spaces",
+            "--output=native",
+            "--vlm-path=local VLM",
+        ])
+        .unwrap();
+        let Command::Convert(args) = cli.command else {
+            panic!("expected convert")
+        };
+        assert!(matches!(args.from, FormatArg::Lerobot));
+        assert!(matches!(args.to, FormatArg::Pneuma));
+        assert_eq!(args.input, PathBuf::from("source with spaces"));
+        assert_eq!(args.vlm_path, Some(PathBuf::from("local VLM")));
     }
 
     #[test]
@@ -244,22 +320,30 @@ mod tests {
     fn overrides_are_validated_after_loading() {
         let cli = Cli::try_parse_from([
             "pneuma",
+            "serve",
             "--config=examples/aloha_sim.toml",
             "--policy=echo",
             "--prediction-steps=100",
         ])
         .unwrap();
-        let mut config = ServerConfig::load(&cli.config).unwrap();
-        cli.apply(&mut config);
+        let Command::Serve(args) = cli.command else {
+            panic!("expected serve")
+        };
+        let mut config = ServerConfig::load(&args.config).unwrap();
+        args.apply(&mut config);
         config.validate().unwrap();
         let cli = Cli::try_parse_from([
             "pneuma",
+            "serve",
             "--config=examples/so101.toml",
             "--action-steps=51",
         ])
         .unwrap();
-        let mut config = ServerConfig::load(&cli.config).unwrap();
-        cli.apply(&mut config);
+        let Command::Serve(args) = cli.command else {
+            panic!("expected serve")
+        };
+        let mut config = ServerConfig::load(&args.config).unwrap();
+        args.apply(&mut config);
         assert!(config.validate().is_err(), "执行步数超过预测长度必须被拒绝");
     }
 
@@ -276,23 +360,24 @@ mod tests {
             ),
             (
                 vec!["pneuma"],
-                clap::error::ErrorKind::MissingRequiredArgument,
+                clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand,
             ),
             (
-                vec!["pneuma", "--config=x.toml", "--model.device=metal"],
+                vec!["pneuma", "serve", "--config=x.toml", "--model.device=metal"],
                 clap::error::ErrorKind::UnknownArgument,
             ),
             (
-                vec!["pneuma", "--config=x.toml", "--device=cuda"],
+                vec!["pneuma", "serve", "--config=x.toml", "--device=cuda"],
                 clap::error::ErrorKind::InvalidValue,
             ),
             (
-                vec!["pneuma", "--config=x.toml", "--action-fps=abc"],
+                vec!["pneuma", "serve", "--config=x.toml", "--action-fps=abc"],
                 clap::error::ErrorKind::ValueValidation,
             ),
             (
                 vec![
                     "pneuma",
+                    "serve",
                     "--config=x.toml",
                     "--listen=tcp/127.0.0.1:7447",
                     "--clear-listen",
@@ -302,6 +387,7 @@ mod tests {
             (
                 vec![
                     "pneuma",
+                    "serve",
                     "--config=x.toml",
                     "--connect=tcp/127.0.0.1:7447",
                     "--clear-connect",

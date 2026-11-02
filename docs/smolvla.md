@@ -20,14 +20,17 @@ checkpoint 目录需包含：
 无需在此目录重复保存。服务不会隐式联网下载。
 
 ```sh
-cargo run --release -- --config=examples/smolvla_libero.toml \
-  --checkpoint=/absolute/path/to/consistent/checkpoint \
-  --vlm-path=/absolute/path/to/SmolVLM2-500M-Video-Instruct \
-  --device=metal
+cargo run --release -- convert --from=lerobot --to=pneuma \
+  --input=/absolute/path/to/consistent/lerobot-checkpoint \
+  --output=outputs/smolvla-native \
+  --vlm-path=/absolute/path/to/SmolVLM2-500M-Video-Instruct
+
+cargo run --release -- serve --config=examples/smolvla_libero.toml \
+  --checkpoint=outputs/smolvla-native --device=metal
 ```
 
-`model.policy=smolvla` 选择策略；`--vlm-path` 覆盖 `model.vlm_path`，省略时使用
-checkpoint 下的 `vlm/`。`--device=flex` 使用 CPU。预测步数与默认执行步数来自
+`model.policy=smolvla` 选择策略；VLM 路径只在 convert 导入时指定，省略时使用源 checkpoint 下的 `vlm/`。
+serve 从原生 checkpoint 加载配置、`model.bpk` 和 pipeline。`--device=flex` 使用 CPU。预测步数与默认执行步数来自
 `chunk_size`、`n_action_steps`；`--action-steps` 可缩短执行片段。客户端使用
 `chunk_merge=append` 并在观测中发送 `task` 字符串。
 

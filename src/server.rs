@@ -1,11 +1,11 @@
 //! PolicyServer：Zenoh IO 泵 + 单会话准入状态机。
 //! 对齐 lerobot `remote_inference/server.py` 的通道布局：
-//!   <deployment>/describe        queryable  DESCRIBE → DESCRIPTOR
-//!   <instance>/open              queryable  OPEN     → ACCEPTED（`session_id` 由服务端生成）
-//!   <instance>/alive             liveliness token（服务端在场）
-//!   <session>/control            queryable  CONTROL  → ACK
-//!   <session>/obs                subscriber OBSERVATION → 发布 ACTION 到 <session>/act
-//!   <session>/alive              客户端在场令牌（骨架未接，缺席宽限为 TODO）
+//!   `<deployment>/describe`        queryable  DESCRIBE → DESCRIPTOR
+//!   `<instance>/open`              queryable  OPEN → ACCEPTED（`session_id` 由服务端生成）
+//!   `<instance>/alive`             liveliness token（服务端在场）
+//!   `<session>/control`            queryable  CONTROL → ACK
+//!   `<session>/obs`                subscriber OBSERVATION → 发布 ACTION 到 `<session>/act`
+//!   `<session>/alive`              客户端在场令牌（骨架未接，缺席宽限为 TODO）
 //!
 //! 支持范围：plain chunk（`chunk_merge=append`）。aligned/blending、RTC、language、
 //! 缺席宽限尚未实现；观测和 status 要求 generation 精确匹配。
@@ -35,10 +35,11 @@ type SubscriberHandle = zenoh::pubsub::Subscriber<()>;
 
 use crate::codec::{self, Limits};
 use crate::config::ServerConfig;
-use crate::policy::PolicyRunner;
+use crate::contract::FeatureSpec;
+use crate::inference::PolicyRunner;
 use crate::protocol::{
-    Capabilities, Envelope, ErrorCode, FeatureSpec, MessageType, ProtocolError, body_get,
-    deployment_prefix, instance_prefix, map, session_prefix,
+    Capabilities, Envelope, ErrorCode, MessageType, ProtocolError, body_get, deployment_prefix,
+    instance_prefix, map, session_prefix,
 };
 
 const LANGUAGE_DEADLINE_S: f64 = 60.0;
@@ -112,7 +113,7 @@ impl IngressSender {
 
 struct Completion {
     envelope: Envelope,
-    result: Result<crate::policy::Chunk, ProtocolError>,
+    result: Result<crate::inference::ActionChunk, ProtocolError>,
     queue_s: f64,
     worker_s: f64,
     _permit: OwnedSemaphorePermit,
@@ -133,7 +134,7 @@ pub struct Server {
     caps: Capabilities,
     /// caps 的 msgpack 形态；描述符每次回带，启动时算一次。
     caps_value: Value,
-    policy: Arc<dyn PolicyRunner>,
+    policy: Arc<PolicyRunner>,
     instance_id: String,
     limits: Limits,
 }
@@ -192,7 +193,7 @@ impl Server {
 
     pub fn new(cfg: ServerConfig) -> anyhow::Result<Self> {
         cfg.validate()?;
-        let (policy, caps) = crate::policy::build(&cfg)?;
+        let (policy, caps) = crate::deployment::build(&cfg)?;
         Ok(Self {
             caps_value: to_value(&caps),
             caps,
@@ -864,14 +865,17 @@ impl Server {
             return None;
         }
         let policy = self.policy.clone();
-        let caps = self.caps.clone();
         Some(tokio::task::spawn_blocking(move || {
             let started = Instant::now();
-            let result = policy.predict(
-                &caps,
+            let result = codec::observation_batch(
                 body_get(&envelope.body, "features").expect("validated features"),
                 body_str(&envelope.body, "task"),
-            );
+            )
+            .and_then(|batch| {
+                policy.predict(batch).map_err(|error| {
+                    ProtocolError::new(ErrorCode::Execution, format!("policy inference: {error:#}"))
+                })
+            });
             let finished = Instant::now();
             Completion {
                 envelope,
@@ -911,19 +915,20 @@ impl Server {
             }
         };
         let dim = self.caps.action_feature.shape[0];
-        let steps = chunk.execution_steps;
-        // canonical 与 model 同一表示（echo 桩）：model_actions 与 canonical 同值。
+        let steps = chunk.steps as u64;
+        let action_bytes = codec::f32_le(&chunk.values);
+        // plain chunk 仅使用 canonical 表示；协议两字段沿用同值。
         let mut entries: Vec<(Value, Value)> = codec::identity_subset(&envelope.body)
             .into_iter()
             .map(|(k, v)| (Value::String(k.into()), v))
             .collect();
         entries.push((
             Value::String("canonical_actions".into()),
-            codec::tensor_record("float32", &[steps, dim], chunk.canonical_actions.clone()),
+            codec::tensor_record("float32", &[steps, dim], action_bytes.clone()),
         ));
         entries.push((
             Value::String("model_actions".into()),
-            codec::tensor_record("float32", &[steps, dim], chunk.canonical_actions),
+            codec::tensor_record("float32", &[steps, dim], action_bytes),
         ));
         entries.push((Value::String("execution_steps".into()), Value::from(steps)));
         tracing::info!(
@@ -1221,43 +1226,66 @@ mod tests {
 
     struct TaskPolicy;
 
-    impl PolicyRunner for TaskPolicy {
+    impl crate::policy::Policy for TaskPolicy {
         fn predict(
             &self,
-            caps: &Capabilities,
-            _features: &Value,
-            task: Option<&str>,
-        ) -> Result<crate::policy::Chunk, ProtocolError> {
-            let value = match task {
+            mut batch: crate::processor::Batch,
+        ) -> anyhow::Result<crate::processor::Batch> {
+            let value = match batch.tasks.first().map(String::as_str) {
                 Some("pick red") => 1f32,
                 Some("pick blue") => 2f32,
-                _ => {
-                    return Err(ProtocolError::new(
-                        ErrorCode::Execution,
-                        "task was not forwarded",
-                    ));
-                }
+                _ => anyhow::bail!("task was not forwarded"),
             };
-            Ok(crate::policy::Chunk {
-                canonical_actions: std::iter::repeat_n(
+            batch.values.clear();
+            batch.values.insert(
+                "action".into(),
+                crate::processor::Data::Float3(burn::prelude::Tensor::full(
+                    [1, 50, 6],
                     value,
-                    (caps.execution_steps * caps.action_feature.shape[0]) as usize,
-                )
-                .flat_map(f32::to_le_bytes)
-                .collect(),
-                execution_steps: caps.execution_steps,
-            })
+                    &burn::prelude::Device::flex(),
+                )),
+            );
+            Ok(batch)
         }
+    }
 
-        fn validate_against(&self, _caps: &Capabilities) -> Result<(), ProtocolError> {
-            Ok(())
-        }
+    fn with_policy(
+        server: &Server,
+        policy: impl crate::policy::Policy + 'static,
+    ) -> Arc<PolicyRunner> {
+        use crate::processor::{DType, Field, Layout, Pipeline, Schema};
+        let steps = server.caps.prediction_steps as usize;
+        let dim = server.caps.action_feature.shape[0] as usize;
+        let output = Schema::from([(
+            "action".into(),
+            Field {
+                shape: vec![Some(1), Some(steps), Some(dim)],
+                dtype: DType::F32,
+                layout: Layout::Flat,
+                optional: false,
+            },
+        )]);
+        Arc::new(
+            PolicyRunner::new(
+                Box::new(policy),
+                (
+                    Pipeline::new(server.policy.preprocessor.input_schema().clone(), vec![])
+                        .unwrap(),
+                    Pipeline::new(output, vec![]).unwrap(),
+                ),
+                burn::prelude::Device::flex(),
+                steps,
+                server.caps.execution_steps as usize,
+                dim,
+            )
+            .unwrap(),
+        )
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn observation_task_conditions_each_prediction_and_is_returned_with_actions() {
         let mut server = server();
-        server.policy = Arc::new(TaskPolicy);
+        server.policy = with_policy(&server, TaskPolicy);
         let wire = Wire::start_with(server).await;
         let accepted = wire.admit().await;
         for (task, expected) in [("pick red", 1f32), ("pick blue", 2f32)] {
@@ -1327,13 +1355,11 @@ mod tests {
         }
     }
 
-    impl PolicyRunner for SlowPolicy {
+    impl crate::policy::Policy for SlowPolicy {
         fn predict(
             &self,
-            caps: &Capabilities,
-            features: &Value,
-            task: Option<&str>,
-        ) -> Result<crate::policy::Chunk, ProtocolError> {
+            batch: crate::processor::Batch,
+        ) -> anyhow::Result<crate::processor::Batch> {
             self.entered.send(()).unwrap();
             let released = self.gate.0.lock().expect("gate poisoned");
             drop(
@@ -1343,14 +1369,17 @@ mod tests {
                     .expect("gate poisoned"),
             );
             if self.fails {
-                Err(ProtocolError::new(ErrorCode::Execution, "gated failure"))
+                anyhow::bail!("gated failure")
             } else {
-                crate::policy::ZeroActionPolicy.predict(caps, features, task)
+                crate::policy::Policy::predict(
+                    &crate::policy::ZeroActionPolicy {
+                        steps: 50,
+                        dim: 6,
+                        device: burn::prelude::Device::flex(),
+                    },
+                    batch,
+                )
             }
-        }
-
-        fn validate_against(&self, _caps: &Capabilities) -> Result<(), ProtocolError> {
-            Ok(())
         }
     }
 
@@ -1360,11 +1389,14 @@ mod tests {
         let (entered, mut entries) = tokio::sync::mpsc::unbounded_channel();
         let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let release = Release(gate.clone());
-        server.policy = Arc::new(SlowPolicy {
-            entered,
-            gate,
-            fails: false,
-        });
+        server.policy = with_policy(
+            &server,
+            SlowPolicy {
+                entered,
+                gate,
+                fails: false,
+            },
+        );
         let wire = Wire::start_with(server).await;
         let accepted = wire.admit().await;
         let envelope = request(
@@ -1415,11 +1447,14 @@ mod tests {
                 let (entered, mut entries) = tokio::sync::mpsc::unbounded_channel();
                 let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
                 let release = Release(gate.clone());
-                server.policy = Arc::new(SlowPolicy {
-                    entered,
-                    gate,
-                    fails,
-                });
+                server.policy = with_policy(
+                    &server,
+                    SlowPolicy {
+                        entered,
+                        gate,
+                        fails,
+                    },
+                );
                 let wire = Wire::start_with(server).await;
                 let old = wire.admit().await.session_id;
                 let old_actions = wire
@@ -1602,9 +1637,15 @@ mod tests {
             0,
             map([]),
         );
-        let chunk = crate::policy::ZeroActionPolicy
-            .predict(&server.caps, &map([]), None)
-            .unwrap();
+        let chunk = crate::inference::ActionChunk {
+            values: vec![
+                0.;
+                (server.caps.execution_steps * server.caps.action_feature.shape[0])
+                    as usize
+            ],
+            steps: server.caps.execution_steps as usize,
+            dim: server.caps.action_feature.shape[0] as usize,
+        };
         server
             .complete_observation(
                 &wire.zenoh,

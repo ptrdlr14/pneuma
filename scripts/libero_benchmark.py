@@ -110,7 +110,6 @@ semantics = "{SEMANTICS}"
 [model]
 policy = "smolvla"
 repo_or_path = {json.dumps(str(checkpoint))}
-vlm_path = {json.dumps(str(args.vlm_path))}
 device = "metal"
 [execution]
 action_fps = 20.0
@@ -145,6 +144,11 @@ semantics = "{SEMANTICS}"
 
 @contextmanager
 def managed_server(args, backend, profile):
+    source = args.output.parent / (args.output.stem + "-checkpoint")
+    native = args.output.parent / (args.output.stem + "-native")
+    if not native.exists():
+        subprocess.run([str(args.server), "convert", "--from=lerobot", "--to=pneuma",
+            f"--input={source}", f"--output={native}", f"--vlm-path={args.vlm_path}"], cwd=ROOT, check=True)
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
@@ -152,7 +156,7 @@ def managed_server(args, backend, profile):
     ready = threading.Event()
     path = args.output.parent / f"{args.output.stem}-{backend}.log"
     with path.open("a") as log:
-        process = subprocess.Popen([str(args.server), f"--config={profile}",
+        process = subprocess.Popen([str(args.server), "serve", f"--config={profile}", f"--checkpoint={native}",
             f"--device={backend}", f"--listen={endpoint}"], cwd=ROOT,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             env={**os.environ, "RUST_LOG": "info", "NO_COLOR": "1"})
