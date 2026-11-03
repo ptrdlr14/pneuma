@@ -3,8 +3,10 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use std::str::FromStr;
 
-use crate::config::{Device, Policy, ServerConfig};
+use crate::config::{Device, ServerConfig};
+use crate::policy::PolicyKind;
 
 /// 原生策略服务与 LeRobot checkpoint 双向转换。
 #[derive(Debug, Parser)]
@@ -35,6 +37,9 @@ pub struct ConvertArgs {
     /// 导入 SmolVLA 时的本地 VLM 资源
     #[arg(long)]
     vlm_path: Option<PathBuf>,
+    /// checkpoint 缺少特征描述时（如 cosmos3）提供合约的 JSON 文件
+    #[arg(long)]
+    features: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -56,6 +61,7 @@ impl ConvertArgs {
             input: self.input,
             output: self.output,
             vlm_path: self.vlm_path,
+            features: self.features,
         })
     }
 }
@@ -80,26 +86,12 @@ struct ModelArgs {
     /// 本地 checkpoint 目录
     #[arg(long)]
     checkpoint: Option<PathBuf>,
-    /// 推理设备
-    #[arg(long, value_enum)]
-    device: Option<DeviceArg>,
+    /// 推理设备：auto|flex|metal|cuda|cuda:N（N 为 GPU 序号，同 PyTorch 写法）
+    #[arg(long, value_parser = Device::from_str)]
+    device: Option<Device>,
     /// 策略类型
     #[arg(long, value_enum)]
-    policy: Option<PolicyArg>,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum DeviceArg {
-    Auto,
-    Flex,
-    Metal,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum PolicyArg {
-    Echo,
-    Act,
-    Smolvla,
+    policy: Option<PolicyKind>,
 }
 
 #[derive(Debug, Args)]
@@ -111,7 +103,7 @@ struct ExecutionArgs {
     /// 每次预测后执行的动作步数
     #[arg(long)]
     action_steps: Option<u64>,
-    /// echo 预测步数；模型策略从 checkpoint 读取
+    /// zero 预测步数；模型策略从 checkpoint 读取
     #[arg(long)]
     prediction_steps: Option<u64>,
     /// 启动预热次数
@@ -139,6 +131,16 @@ struct NetworkArgs {
     clear_connect: bool,
 }
 
+impl ValueEnum for PolicyKind {
+    fn value_variants<'a>() -> &'a [Self] {
+        &PolicyKind::ALL
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(clap::builder::PossibleValue::new(self.as_str()))
+    }
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ZenohMode {
     Peer,
@@ -152,18 +154,10 @@ impl ServeArgs {
             config.model.repo_or_path = path;
         }
         if let Some(device) = self.model.device {
-            config.model.device = match device {
-                DeviceArg::Auto => Device::Auto,
-                DeviceArg::Flex => Device::Flex,
-                DeviceArg::Metal => Device::Metal,
-            };
+            config.model.device = device;
         }
         if let Some(policy) = self.model.policy {
-            config.model.policy = match policy {
-                PolicyArg::Echo => Policy::Echo,
-                PolicyArg::Act => Policy::Act,
-                PolicyArg::Smolvla => Policy::Smolvla,
-            };
+            config.model.policy = policy;
         }
         if let Some(fps) = self.execution.action_fps {
             config.execution.action_fps = fps;
@@ -227,7 +221,7 @@ mod tests {
         let config = load(&[
             "--device=flex",
             "--checkpoint=/tmp/model with spaces",
-            "--policy=echo",
+            "--policy=zero",
             "--action-fps=50",
             "--action-steps=20",
             "--prediction-steps=60",
@@ -273,7 +267,7 @@ mod tests {
         let mut config = ServerConfig::load(&args.config).unwrap();
         args.apply(&mut config);
         config.validate().unwrap();
-        assert!(matches!(config.model.policy, Policy::Smolvla));
+        assert!(matches!(config.model.policy, PolicyKind::Smolvla));
         assert!(
             Cli::try_parse_from(["pneuma", "serve", "--config=x", "--vlm-path=external"]).is_err()
         );
@@ -322,7 +316,7 @@ mod tests {
             "pneuma",
             "serve",
             "--config=examples/aloha_sim.toml",
-            "--policy=echo",
+            "--policy=zero",
             "--prediction-steps=100",
         ])
         .unwrap();
@@ -367,8 +361,9 @@ mod tests {
                 clap::error::ErrorKind::UnknownArgument,
             ),
             (
-                vec!["pneuma", "serve", "--config=x.toml", "--device=cuda"],
-                clap::error::ErrorKind::InvalidValue,
+                // `--device` 走自定义 parser 以支持 `cuda:N`，所以非法值报 ValueValidation。
+                vec!["pneuma", "serve", "--config=x.toml", "--device=vulkan"],
+                clap::error::ErrorKind::ValueValidation,
             ),
             (
                 vec!["pneuma", "serve", "--config=x.toml", "--action-fps=abc"],

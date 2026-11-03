@@ -8,7 +8,13 @@ use serde::{Deserialize, Serialize};
 
 use super::{Batch, Context, DType, Field, Layout, Schema};
 
+fn default_true() -> bool {
+    true
+}
+
 pub(super) const TOKENS: &str = "observation.language.tokens";
+/// 负向提示 token（无分类器引导用）。
+pub(super) const NEGATIVE: &str = "observation.language.negative_tokens";
 pub(super) const MASK: &str = "observation.language.attention_mask";
 
 /// 只注册已实现的确定性转换，统计由产物层单独保存。
@@ -48,11 +54,41 @@ pub enum Step {
         width: usize,
     },
     Newline,
+    /// π₀.₅ 风格提示词：`Task: {task}, State: {bins};\nAction: `。
+    Prompt {
+        state_key: String,
+        bins: usize,
+    },
     Tokenize {
         tokenizer: PathBuf,
         max_length: usize,
         padding: String,
         padding_side: String,
+        /// 是否自动追加特殊 token；Cosmos3 的提示必须关闭。
+        #[serde(default = "default_true")]
+        special_tokens: bool,
+        /// 可选：额外分词该文本，写到 `observation.language.negative_tokens`。
+        #[serde(default)]
+        negative: Option<String>,
+    },
+    /// Cosmos3 的视频画布：把多个相机视角拼成一张画布。
+    Cosmos3Canvas {
+        cameras: Vec<String>,
+        view_width: usize,
+        view_height: usize,
+        output: String,
+    },
+    /// Cosmos3 的 JSON 提示：把任务改写成模板包裹的文本。
+    Cosmos3Caption {
+        height: usize,
+        width: usize,
+        fps: f64,
+        chunk_size: usize,
+        use_state: bool,
+        view: String,
+        /// 可选：用于校验尺寸的画布字段。
+        #[serde(default)]
+        canvas_key: Option<String>,
     },
     Device,
     Host,
@@ -215,12 +251,97 @@ impl Step {
                     .context("missing feature dimension")? = Some(*width);
             }
             Self::Newline => {}
+            Self::Prompt { state_key, bins } => {
+                ensure!(*bins >= 2, "prompt bin count must be at least 2");
+                ensure!(!device.contains(state_key), "Prompt requires host data");
+                let field = field_mut(schema, state_key)?;
+                ensure!(
+                    field.dtype == DType::F32
+                        && field.layout == Layout::Flat
+                        && field.shape.len() == 2,
+                    "Prompt requires a batched flat f32 state"
+                );
+            }
+            Self::Cosmos3Canvas {
+                cameras,
+                view_width,
+                view_height,
+                output,
+            } => {
+                ensure!(
+                    !cameras.is_empty() && *view_width > 0 && *view_height > 0,
+                    "cosmos3 canvas needs cameras and a positive view size"
+                );
+                for camera in cameras {
+                    let field = field_mut(schema, camera)?;
+                    ensure!(
+                        field.dtype == DType::F32
+                            && field.shape.len() == 4
+                            && field.shape[1] == Some(3),
+                        "cosmos3 canvas inputs must be f32 images with three channels"
+                    );
+                }
+                let canvas = crate::policy::cosmos3::canvas::canvas_size(
+                    *view_height,
+                    *view_width * cameras.len(),
+                );
+                let (width, height) = canvas.context("unsupported cosmos3 canvas size")?;
+                schema.insert(
+                    output.clone(),
+                    Field {
+                        shape: vec![Some(1), Some(3), Some(height), Some(width)],
+                        dtype: DType::F32,
+                        layout: Layout::Flat,
+                        optional: false,
+                    },
+                );
+            }
+            Self::Cosmos3Caption {
+                height,
+                width,
+                fps,
+                chunk_size,
+                canvas_key,
+                ..
+            } => {
+                ensure!(
+                    *height > 0 && *width > 0 && *fps > 0.0 && *chunk_size > 0,
+                    "cosmos3 caption needs positive canvas, fps and chunk size"
+                );
+                if let Some(key) = canvas_key {
+                    let field = field_mut(schema, key)?;
+                    ensure!(
+                        field.shape.len() == 4
+                            && field.shape[2] == Some(*height)
+                            && field.shape[3] == Some(*width),
+                        "cosmos3 caption size must match the canvas field"
+                    );
+                }
+            }
             Self::Tokenize {
                 max_length,
                 padding,
                 padding_side,
+                negative,
                 ..
             } => {
+                if negative.is_some() {
+                    ensure!(
+                        !schema.contains_key(NEGATIVE),
+                        "tokenizer output {} already exists",
+                        NEGATIVE
+                    );
+                    schema.insert(
+                        NEGATIVE.into(),
+                        Field {
+                            shape: vec![None, None],
+                            dtype: DType::I64,
+                            layout: Layout::Flat,
+                            optional: false,
+                        },
+                    );
+                    device.insert(NEGATIVE.into());
+                }
                 ensure!(
                     matches!(padding_side.as_str(), "left" | "right"),
                     "unsupported tokenizer padding_side"
@@ -289,6 +410,7 @@ impl Step {
                 max_length,
                 padding,
                 padding_side,
+                ..
             } => super::tokenize::load(tokenizer, *max_length, padding, padding_side).map(Some),
             _ => Ok(None),
         }

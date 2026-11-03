@@ -1,0 +1,46 @@
+# Cosmos3 Edge LIBERO 合约模板：2 路相机、8 维状态、7 维动作。
+# 权重来自 lerobot/cosmos3-edge；该 checkpoint 的 features 为空，转换时需用
+# `--features examples/cosmos3_libero_features.json` 提供同一份合约。
+deployment = "libero"
+semantics = "libero-end-effector-delta-v1"
+
+[model]
+policy = "cosmos3_edge"
+repo_or_path = "/absolute/path/to/native/cosmos3-checkpoint"
+device = "cuda:7"
+
+[execution]
+supported_modes = ["chunk"]
+action_fps = 10.0
+action_deadline_s = 120.0
+warmup_calls = 1
+
+[zenoh]
+mode = "peer"
+listen_endpoints = ["tcp/127.0.0.1:7447"]
+
+[[features]]
+name = "observation.state"
+shape = [7]
+dtype = "float32"
+semantics = "libero-eef-position-axis-angle-gripper-qpos-v1"
+
+[[features]]
+name = "observation.images.image"
+shape = [256, 256, 3]
+dtype = "uint8"
+kind = "rgb"
+semantics = "libero-agentview-rgb-v1"
+
+[[features]]
+name = "observation.images.image2"
+shape = [256, 256, 3]
+dtype = "uint8"
+kind = "rgb"
+semantics = "libero-wrist-rgb-v1"
+
+[action_feature]
+name = "action"
+shape = [7]
+dtype = "float32"
+semantics = "libero-end-effector-delta-v1"

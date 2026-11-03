@@ -33,13 +33,7 @@ fn schema(shape: &[usize]) -> Schema {
 
 fn input(shape: &[usize], values: &[f32]) -> Batch {
     Batch {
-        values: BTreeMap::from([(
-            "state".into(),
-            Data::F32 {
-                values: values.to_vec(),
-                shape: shape.to_vec(),
-            },
-        )]),
+        values: BTreeMap::from([("state".into(), Data::f32(values.to_vec(), shape.to_vec()))]),
         tasks: vec![],
     }
 }
@@ -53,7 +47,7 @@ fn context(mode: Mode) -> Context {
 
 fn values(batch: &Batch, key: &str) -> Vec<f32> {
     match batch.get(key).unwrap() {
-        Data::F32 { values, .. } => values.clone(),
+        Data::Host(_) => batch.get(key).unwrap().host_f32().unwrap().to_vec(),
         Data::Float2(t) => t.to_data().try_to_vec().unwrap(),
         Data::Float3(t) => t.to_data().try_to_vec().unwrap(),
         Data::Float4(t) => t.to_data().try_to_vec().unwrap(),
@@ -171,10 +165,7 @@ fn single_sample_rgb_resize_and_normalized_padding_match_image_contract() {
     let batch = Batch {
         values: BTreeMap::from([(
             "image".into(),
-            Data::U8 {
-                shape: vec![1, 2, 3],
-                values: vec![255, 0, 128, 0, 255, 64],
-            },
+            Data::u8(vec![255, 0, 128, 0, 255, 64], vec![1, 2, 3]),
         )]),
         tasks: vec![],
     };
@@ -226,11 +217,8 @@ fn schema_and_dynamic_values_fail_before_invalid_operations() {
         .is_err()
     );
     let pipeline = Pipeline::new(schema(&[1, 2]), vec![Step::Device]).unwrap();
-    assert!(
-        pipeline
-            .run(input(&[1, 2], &[1.0]), &context(Mode::Eval))
-            .is_err()
-    );
+    // 长度与形状不符的数据在构造期就被拒绝，不再进入管线。
+    assert!(Data::try_f32(vec![1.0], vec![1, 2]).is_err());
     assert!(
         pipeline
             .run(input(&[1, 2], &[1.0, f32::NAN]), &context(Mode::Eval))
@@ -309,20 +297,8 @@ fn optional_actions_skip_only_when_schema_allows_and_rename_is_simultaneous() {
     .unwrap();
     let batch = Batch {
         values: BTreeMap::from([
-            (
-                "a".into(),
-                Data::F32 {
-                    values: vec![1.0],
-                    shape: vec![1],
-                },
-            ),
-            (
-                "b".into(),
-                Data::F32 {
-                    values: vec![2.0],
-                    shape: vec![1],
-                },
-            ),
+            ("a".into(), Data::f32(vec![1.0], vec![1])),
+            ("b".into(), Data::f32(vec![2.0], vec![1])),
         ]),
         tasks: vec![],
     };
@@ -367,6 +343,8 @@ fn saved_pipeline_is_relocatable_and_validates_versions_and_resource_digests() {
                 max_length: 2,
                 padding: "max_length".into(),
                 padding_side: "right".into(),
+                special_tokens: true,
+                negative: None,
             },
             Step::Device,
         ],
@@ -428,9 +406,95 @@ fn tokenizer_configuration_is_checked_at_construction() {
                 tokenizer: source.0.clone(),
                 max_length: 2,
                 padding: "longest".into(),
-                padding_side: "right".into()
+                padding_side: "right".into(),
+                special_tokens: true,
+                negative: None,
             }]
         )
         .is_err()
+    );
+}
+
+/// Cosmos3 画布步骤与官方预处理结果对齐（最多 1 个灰阶）。
+#[test]
+#[ignore = "需要官方画布参照"]
+fn cosmos3_canvas_matches_official() {
+    use burn::tensor::{Tensor, TensorData};
+
+    let parity = std::path::PathBuf::from(
+        std::env::var("PNEUMA_COSMOS3_COMPOSE").expect("PNEUMA_COSMOS3_COMPOSE"),
+    );
+    let read = |name: &str| -> Vec<f32> {
+        let bytes = std::fs::read(parity.join(name)).expect("reading reference");
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|value| f32::from_le_bytes(*value))
+            .collect()
+    };
+    let context = context(Mode::Eval);
+    let device = context.device.clone();
+    let mut schema = Schema::new();
+    for key in ["a", "b"] {
+        schema.insert(
+            key.to_string(),
+            Field {
+                shape: vec![Some(1), Some(3), Some(256), Some(256)],
+                dtype: DType::F32,
+                layout: Layout::Flat,
+                optional: false,
+            },
+        );
+    }
+    let pipeline = Pipeline::new(
+        schema,
+        vec![Step::Cosmos3Canvas {
+            cameras: vec!["a".into(), "b".into()],
+            view_width: 256,
+            view_height: 256,
+            output: "observation.images.canvas".into(),
+        }],
+    )
+    .expect("pipeline");
+    let batch = Batch {
+        values: BTreeMap::from([
+            (
+                "a".to_string(),
+                Data::Float4(Tensor::<4>::from_data(
+                    TensorData::new(read("first.bin"), [1, 3, 256, 256]),
+                    &device,
+                )),
+            ),
+            (
+                "b".to_string(),
+                Data::Float4(Tensor::<4>::from_data(
+                    TensorData::new(read("second.bin"), [1, 3, 256, 256]),
+                    &device,
+                )),
+            ),
+        ]),
+        tasks: vec!["task".into()],
+    };
+    let batch = pipeline.run(batch, &context).expect("run");
+    let canvas = match batch.values.get("observation.images.canvas") {
+        Some(Data::Float4(canvas)) => canvas.clone(),
+        other => panic!("unexpected output {:?}", other.map(Data::shape)),
+    };
+    assert_eq!(canvas.dims(), [1, 3, 192, 320]);
+    let got: Vec<f32> = canvas.into_data().iter::<f32>().collect();
+    let expected = read("canvas.bin");
+    let levels: Vec<f32> = got
+        .iter()
+        .zip(&expected)
+        .map(|(a, b)| ((a - b).abs() * 127.5).round())
+        .collect();
+    let max = levels.iter().copied().fold(0.0f32, f32::max);
+    let differing = levels.iter().filter(|level| **level > 0.0).count();
+    println!("pipeline canvas levels max {max} differing {differing}");
+    assert!(max <= 1.0, "canvas differs by {max} levels");
+    assert!(
+        differing * 100 < levels.len(),
+        "too many differing pixels: {differing}"
     );
 }

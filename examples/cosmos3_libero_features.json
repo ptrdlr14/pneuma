@@ -1,0 +1,10 @@
+{
+  "input_features": {
+    "observation.images.image": { "type": "VISUAL", "shape": [3, 256, 256] },
+    "observation.images.image2": { "type": "VISUAL", "shape": [3, 256, 256] },
+    "observation.state": { "type": "STATE", "shape": [7] }
+  },
+  "output_features": {
+    "action": { "type": "ACTION", "shape": [7] }
+  }
+}

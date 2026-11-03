@@ -37,6 +37,13 @@ def checkpoint_dir() -> str:
     env = os.environ.get("PNEUMA_ACT_CKPT")
     if env:
         return env
+    # ModelScope 目录约定：<根目录>/<owner>/<name>，优先级高于旧的 HF 缓存。
+    for candidate in (
+        Path("/data/nvme1/modelscope/lerobot/act_aloha_sim_transfer_cube_human"),
+        Path.home() / "modelscope" / "lerobot" / "act_aloha_sim_transfer_cube_human",
+    ):
+        if (candidate / "config.json").is_file():
+            return str(candidate)
     hub = Path.home() / ".cache" / "huggingface" / "hub"
     snaps = sorted(
         glob.glob(
@@ -44,7 +51,10 @@ def checkpoint_dir() -> str:
         )
     )
     if not snaps:
-        raise SystemExit("未找到 checkpoint：先 huggingface-cli download 或设 PNEUMA_ACT_CKPT")
+        raise SystemExit(
+            "未找到 checkpoint：用 modelscope download 下到 /data/nvme1/modelscope，"
+            "或设 PNEUMA_ACT_CKPT"
+        )
     return snaps[-1]
 
 

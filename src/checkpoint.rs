@@ -11,6 +11,7 @@ use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::policy::PolicyKind;
 use crate::processor::Pipeline;
 
 const VERSION: u32 = 2;
@@ -19,7 +20,7 @@ const MANIFEST: &str = "manifest.json";
 /// 一套经过摘要校验的原生模型与数据转换。
 #[derive(Debug)]
 pub struct Checkpoint {
-    pub policy_kind: String,
+    pub policy_kind: PolicyKind,
     pub model_dir: PathBuf,
     pub vlm_path: Option<PathBuf>,
     pub preprocessor: Pipeline,
@@ -29,7 +30,7 @@ pub struct Checkpoint {
 
 /// 保存时的只读配置与 pipeline；权重由调用方从活模型写入。
 pub struct CheckpointParts<'a> {
-    pub policy_kind: &'a str,
+    pub policy_kind: PolicyKind,
     pub config: &'a Path,
     pub vlm: Option<&'a Path>,
     pub preprocessor: &'a Pipeline,
@@ -40,7 +41,7 @@ pub struct CheckpointParts<'a> {
 #[serde(deny_unknown_fields)]
 struct Manifest {
     version: u32,
-    policy_kind: String,
+    policy_kind: PolicyKind,
     model_config: PathBuf,
     model_weights: PathBuf,
     preprocessor: PathBuf,
@@ -63,7 +64,6 @@ impl Checkpoint {
         parts: &CheckpointParts<'_>,
         write: impl FnOnce(&Path, &Path) -> Result<()>,
     ) -> Result<()> {
-        validate_policy(parts.policy_kind)?;
         staging(destination, |root| {
             fs::create_dir(root.join("model"))?;
             fs::copy(parts.config, root.join("model/config.json"))?;
@@ -74,8 +74,15 @@ impl Checkpoint {
             parts.postprocessor.save(&root.join("postprocessor"))?;
             let vlm_path = if let Some(vlm) = parts.vlm {
                 fs::create_dir(root.join("vlm"))?;
+                ensure!(
+                    vlm.join("tokenizer.json").is_file(),
+                    "tokenizer resource {} is missing",
+                    vlm.join("tokenizer.json").display()
+                );
                 for file in ["config.json", "tokenizer.json", "tokenizer_config.json"] {
-                    fs::copy(vlm.join(file), root.join("vlm").join(file))?;
+                    if vlm.join(file).is_file() {
+                        fs::copy(vlm.join(file), root.join("vlm").join(file))?;
+                    }
                 }
                 for file in [
                     "preprocessor_config.json",
@@ -97,7 +104,7 @@ impl Checkpoint {
             };
             let manifest = Manifest {
                 version: VERSION,
-                policy_kind: parts.policy_kind.into(),
+                policy_kind: parts.policy_kind,
                 model_config: "model/config.json".into(),
                 model_weights: "model/model.bpk".into(),
                 preprocessor: "preprocessor".into(),
@@ -112,7 +119,7 @@ impl Checkpoint {
         })
     }
 
-    /// 加载原生 bpk checkpoint；不接受旧 safetensors 部署快照或隐式联网。
+    /// 加载原生 bpk checkpoint。
     ///
     /// # Errors
     /// 未知版本、资源摘要不符、越界引用或非法 bpk 均拒绝加载。
@@ -130,7 +137,6 @@ impl Checkpoint {
             "unsupported checkpoint version {}; convert the LeRobot source again",
             manifest.version
         );
-        validate_policy(&manifest.policy_kind)?;
         let actual = resource_hashes(&root)?;
         ensure!(
             actual == manifest.resources,
@@ -157,8 +163,15 @@ impl Checkpoint {
             .vlm_path
             .as_ref()
             .map(|relative| -> Result<PathBuf> {
-                for file in ["config.json", "tokenizer.json", "tokenizer_config.json"] {
-                    listed_file(&root, &actual, &relative.join(file))?;
+                // `config.json` 只有部分分词器目录带；`tokenizer.json` 必须存在。
+                listed_file(&root, &actual, &relative.join("tokenizer.json"))?;
+                let config = relative.join("config.json");
+                if actual.contains_key(&config) {
+                    listed_file(&root, &actual, &config)?;
+                }
+                let tokenizer_config = relative.join("tokenizer_config.json");
+                if actual.contains_key(&tokenizer_config) {
+                    listed_file(&root, &actual, &tokenizer_config)?;
                 }
                 local_path(&root, relative)
             })
@@ -181,14 +194,6 @@ impl Checkpoint {
             interop_dir,
         })
     }
-}
-
-fn validate_policy(kind: &str) -> Result<()> {
-    ensure!(
-        matches!(kind, "act" | "smolvla"),
-        "unsupported checkpoint policy {kind}"
-    );
-    Ok(())
 }
 
 fn listed_file(
@@ -338,7 +343,7 @@ mod tests {
         Checkpoint::save(
             output,
             &CheckpointParts {
-                policy_kind: "act",
+                policy_kind: PolicyKind::Act,
                 config: &config,
                 vlm: None,
                 preprocessor: &pre,
@@ -364,7 +369,7 @@ mod tests {
         let output = dir.0.join("native");
         save(&dir.0, &output).unwrap();
         let loaded = Checkpoint::load(&output).unwrap();
-        assert_eq!(loaded.policy_kind, "act");
+        assert_eq!(loaded.policy_kind, PolicyKind::Act);
         assert!(!loaded.model_dir.join("model.safetensors").exists());
         let tensors = burn_pack::Reader::from_file_exact(loaded.model_dir.join("model.bpk"))
             .unwrap()
@@ -372,14 +377,7 @@ mod tests {
             .unwrap();
         assert_eq!(tensors[0].param_id, Some(42));
         let batch = Batch {
-            values: [(
-                "state".into(),
-                Data::F32 {
-                    values: vec![5.],
-                    shape: vec![1],
-                },
-            )]
-            .into(),
+            values: [("state".into(), Data::f32(vec![5.], vec![1]))].into(),
             ..Batch::default()
         };
         let output_batch = loaded
@@ -392,9 +390,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let Data::F32 { values, .. } = output_batch.get("state").unwrap() else {
-            panic!("expected host")
-        };
+        let values = output_batch.get("state").unwrap().host_f32().unwrap();
         assert_eq!(values, &[2.]);
         assert!(save(&dir.0, &output).is_err());
         fs::write(output.join("model/model.bpk"), b"bad").unwrap();

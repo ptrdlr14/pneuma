@@ -20,7 +20,10 @@ use crate::{
     checkpoint::{self, Checkpoint, CheckpointParts},
     config::Device,
     contract::FeatureSpec,
-    policy::{act::ActPolicy, smolvla::SmolVlaPolicy},
+    policy::{
+        PolicyKind, act::ActPolicy, cosmos3::Cosmos3Policy, pi05::Pi05Policy,
+        smolvla::SmolVlaPolicy,
+    },
     processor::Pipeline,
 };
 
@@ -39,6 +42,8 @@ pub struct ConvertOptions {
     pub from: Format,
     pub to: Format,
     pub vlm_path: Option<PathBuf>,
+    /// checkpoint 没有特征描述时使用的外部合约。
+    pub features: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -86,8 +91,9 @@ fn import(options: &ConvertOptions) -> Result<()> {
     let config: serde_json::Value = serde_json::from_slice(&fs::read(&config_path)?)?;
     let kind = config["type"]
         .as_str()
-        .context("checkpoint config requires type")?;
-    let vlm = if kind == "smolvla" {
+        .context("checkpoint config requires type")?
+        .parse::<PolicyKind>()?;
+    let vlm = if matches!(kind, PolicyKind::Smolvla | PolicyKind::Pi05) {
         Some(
             options
                 .vlm_path
@@ -97,12 +103,12 @@ fn import(options: &ConvertOptions) -> Result<()> {
     } else {
         ensure!(
             options.vlm_path.is_none(),
-            "vlm-path is only valid for SmolVLA"
+            "vlm-path is only valid for SmolVLA and pi05"
         );
         None
     };
     match kind {
-        "act" => {
+        PolicyKind::Act => {
             let (model, pre, post, _) = ActPolicy::import_configured(&options.input, Device::Flex)?;
             save_import(
                 options,
@@ -114,8 +120,8 @@ fn import(options: &ConvertOptions) -> Result<()> {
                 |path| model.export_lerobot(path),
             )
         }
-        "smolvla" => {
-            let (features, action) = feature_contract(&config)?;
+        PolicyKind::Smolvla => {
+            let (features, action) = feature_contract(&config, options.features.as_deref())?;
             let (model, pre, post, _) = SmolVlaPolicy::import_configured(
                 &options.input,
                 vlm.as_deref(),
@@ -133,13 +139,52 @@ fn import(options: &ConvertOptions) -> Result<()> {
                 |path| model.export_lerobot(path),
             )
         }
-        _ => bail!("unsupported conversion policy {kind}"),
+        PolicyKind::Pi05 => {
+            // 补零相机由 checkpoint 的 empty_cameras 表达，客户端不发送，也不进入部署合约。
+            let (features, action) = feature_contract(&config, options.features.as_deref())?;
+            let features: Vec<FeatureSpec> = features
+                .into_iter()
+                .filter(|feature| !feature.name.starts_with("observation.images.empty_camera_"))
+                .collect();
+            let (model, pre, post, _) = Pi05Policy::import_configured(
+                &options.input,
+                vlm.as_deref(),
+                Device::Flex,
+                &features,
+                &action,
+            )?;
+            save_import(
+                options,
+                kind,
+                vlm.as_deref(),
+                &pre,
+                &post,
+                |path| model.save_native(path),
+                |path| model.export_lerobot(path),
+            )
+        }
+        PolicyKind::Cosmos3Edge => {
+            let (features, action) = feature_contract(&config, options.features.as_deref())?;
+            let tokenizer = options.input.join("tokenizer");
+            let (model, pre, post, _) =
+                Cosmos3Policy::import_configured(&options.input, Device::Flex, &features, &action)?;
+            save_import(
+                options,
+                kind,
+                Some(&tokenizer),
+                &pre,
+                &post,
+                |path| model.save_native(path),
+                |path| model.export_lerobot(path),
+            )
+        }
+        PolicyKind::Zero => bail!("unsupported conversion policy {kind}"),
     }
 }
 
 fn save_import(
     options: &ConvertOptions,
-    kind: &str,
+    kind: PolicyKind,
     vlm: Option<&Path>,
     pre: &Pipeline,
     post: &Pipeline,
@@ -240,16 +285,19 @@ fn export(options: &ConvertOptions) -> Result<()> {
     );
     checkpoint::staging(&options.output, |root| {
         let active = root.join("active.safetensors");
-        match native.policy_kind.as_str() {
-            "act" => {
+        match native.policy_kind {
+            PolicyKind::Act => {
                 ActPolicy::load_model(&native.model_dir, Device::Flex)?.export_lerobot(&active)?
             }
-            "smolvla" => SmolVlaPolicy::load_model(
+            PolicyKind::Smolvla => SmolVlaPolicy::load_model(
                 &native.model_dir,
                 native.vlm_path.as_deref(),
                 Device::Flex,
             )?
             .export_lerobot(&active)?,
+            PolicyKind::Pi05 => {
+                Pi05Policy::load_model(&native.model_dir, Device::Flex)?.export_lerobot(&active)?
+            }
             _ => bail!("unsupported native policy"),
         }
         merge_weights(
@@ -433,7 +481,19 @@ fn copy_interop(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-fn feature_contract(config: &serde_json::Value) -> Result<(Vec<FeatureSpec>, FeatureSpec)> {
+fn feature_contract(
+    config: &serde_json::Value,
+    external: Option<&Path>,
+) -> Result<(Vec<FeatureSpec>, FeatureSpec)> {
+    let owned;
+    let config = match external {
+        Some(path) => {
+            owned = serde_json::from_slice::<serde_json::Value>(&fs::read(path)?)
+                .with_context(|| format!("reading features from {}", path.display()))?;
+            &owned
+        }
+        None => config,
+    };
     let input = config["input_features"]
         .as_object()
         .context("input_features must be an object")?;
@@ -704,6 +764,7 @@ mod tests {
             from: Format::Lerobot,
             to: Format::Lerobot,
             vlm_path: None,
+            features: None,
         };
         assert!(run(&options).is_err());
         options.to = Format::Pneuma;

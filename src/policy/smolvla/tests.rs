@@ -110,10 +110,7 @@ fn smolvla_parity() {
     let mut raw = Batch {
         values: [(
             "observation.state".into(),
-            Data::F32 {
-                values: raw_state,
-                shape: vec![cfg.state_dim()],
-            },
+            Data::f32(raw_state, vec![cfg.state_dim()]),
         )]
         .into(),
         tasks: vec![task.into()],
@@ -125,10 +122,7 @@ fn smolvla_parity() {
             .collect();
         raw.values.insert(
             name.into(),
-            Data::U8 {
-                values,
-                shape: vec![feature.shape[1], feature.shape[2], 3],
-            },
+            Data::u8(values, vec![feature.shape[1], feature.shape[2], 3]),
         );
     }
     let context = Context {

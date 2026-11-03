@@ -1,14 +1,17 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, bail, ensure};
-use burn::tensor::{Bool, Int, Tensor};
+use burn::tensor::{Bool, DType as BurnDType, Int, Tensor, TensorData};
 use serde::{Deserialize, Serialize};
 
 /// 主机数组与设备 tensor 保持不同值域，转换必须由步骤显式完成。
+///
+/// 宿主侧统一用 `TensorData`：它自带 dtype 与形状，`f32`/`u8`/`i64`/`bool` 共用一种表示。
+/// 构造与取值都是零拷贝。
 #[derive(Clone, Debug)]
 pub enum Data {
-    F32 { values: Vec<f32>, shape: Vec<usize> },
-    U8 { values: Vec<u8>, shape: Vec<usize> },
+    /// 宿主数据：仍在内存中，未绑定设备。
+    Host(TensorData),
     Float2(Tensor<2>),
     Float3(Tensor<3>),
     Float4(Tensor<4>),
@@ -17,9 +20,77 @@ pub enum Data {
 }
 
 impl Data {
+    pub fn f32(values: Vec<f32>, shape: Vec<usize>) -> Self {
+        Self::Host(TensorData::new(values, shape))
+    }
+
+    pub fn u8(values: Vec<u8>, shape: Vec<usize>) -> Self {
+        Self::Host(TensorData::new(values, shape))
+    }
+
+    /// 外部输入使用的构造：长度与形状不符时返回错误，不 panic。
+    pub fn try_f32(values: Vec<f32>, shape: Vec<usize>) -> Result<Self> {
+        ensure!(
+            element_count(&shape)? == values.len(),
+            "array length differs from shape"
+        );
+        Ok(Self::f32(values, shape))
+    }
+
+    pub fn try_u8(values: Vec<u8>, shape: Vec<usize>) -> Result<Self> {
+        ensure!(
+            element_count(&shape)? == values.len(),
+            "array length differs from shape"
+        );
+        Ok(Self::u8(values, shape))
+    }
+
+    pub fn host(&self) -> Result<&TensorData> {
+        match self {
+            Self::Host(data) => Ok(data),
+            other => bail!("expected host data, got {:?}", other.shape()),
+        }
+    }
+
+    pub fn host_mut(&mut self) -> Result<&mut TensorData> {
+        match self {
+            Self::Host(data) => Ok(data),
+            other => bail!("expected host data, got {:?}", other.shape()),
+        }
+    }
+
+    /// 宿主 f32 视图；元素类型不匹配时报错。
+    pub fn host_f32(&self) -> Result<&[f32]> {
+        self.host()?
+            .as_slice::<f32>()
+            .context("host data is not f32")
+    }
+
+    pub fn host_f32_mut(&mut self) -> Result<&mut [f32]> {
+        self.host_mut()?
+            .as_mut_slice::<f32>()
+            .context("host data is not f32")
+    }
+
+    pub fn host_u8(&self) -> Result<&[u8]> {
+        self.host()?.as_slice::<u8>().context("host data is not u8")
+    }
+
+    /// 在最前面插入 batch 轴；字节不动，只换形状。
+    pub(super) fn insert_batch_dim(&mut self) -> Result<()> {
+        let Self::Host(data) = self else {
+            bail!("Batch requires host arrays")
+        };
+        let (bytes, shape, dtype) = data.clone().into_parts();
+        let mut shape = shape.to_vec();
+        shape.insert(0, 1);
+        *data = TensorData::from_bytes(bytes, shape, dtype);
+        Ok(())
+    }
+
     pub fn shape(&self) -> Vec<usize> {
         match self {
-            Self::F32 { shape, .. } | Self::U8 { shape, .. } => shape.clone(),
+            Self::Host(data) => data.shape().to_vec(),
             Self::Float2(t) => t.dims().to_vec(),
             Self::Float3(t) => t.dims().to_vec(),
             Self::Float4(t) => t.dims().to_vec(),
@@ -49,18 +120,28 @@ impl Data {
         }
     }
 
-    fn dtype(&self) -> DType {
+    /// 宿主 dtype 映射到 schema 的 dtype；未知类型留给 `validate` 报错。
+    fn dtype(&self) -> Option<DType> {
         match self {
-            Self::F32 { .. } | Self::Float2(_) | Self::Float3(_) | Self::Float4(_) => DType::F32,
-            Self::U8 { .. } => DType::U8,
-            Self::Int2(_) => DType::I64,
-            Self::Bool2(_) => DType::Bool,
+            Self::Host(data) => match data.dtype() {
+                BurnDType::U8 => Some(DType::U8),
+                BurnDType::F32 => Some(DType::F32),
+                BurnDType::I64 => Some(DType::I64),
+                BurnDType::Bool(_) => Some(DType::Bool),
+                _ => None,
+            },
+            Self::Float2(_) | Self::Float3(_) | Self::Float4(_) => Some(DType::F32),
+            Self::Int2(_) => Some(DType::I64),
+            Self::Bool2(_) => Some(DType::Bool),
         }
     }
 
     pub(super) fn validate(&self, field: &Field, numeric: bool) -> Result<()> {
         let shape = self.shape();
-        ensure!(self.dtype() == field.dtype, "dtype differs from schema");
+        let dtype = self
+            .dtype()
+            .with_context(|| format!("unsupported host dtype for {}", field.shape.len()))?;
+        ensure!(dtype == field.dtype, "dtype differs from schema");
         ensure!(shape.len() == field.shape.len(), "rank differs from schema");
         for (actual, expected) in shape.iter().zip(&field.shape) {
             ensure!(*actual > 0, "empty dimensions are unsupported");
@@ -72,15 +153,17 @@ impl Data {
         }
         let count = element_count(&shape)?;
         match self {
-            Self::F32 { values, .. } => {
-                ensure!(values.len() == count, "array length differs from shape");
+            Self::Host(data) => {
                 ensure!(
-                    !numeric || values.iter().all(|x| x.is_finite()),
-                    "non-finite numeric value"
+                    data.num_elements() == count,
+                    "array length differs from shape"
                 );
-            }
-            Self::U8 { values, .. } => {
-                ensure!(values.len() == count, "array length differs from shape")
+                if numeric && data.dtype() == BurnDType::F32 {
+                    ensure!(
+                        self.host_f32()?.iter().all(|x| x.is_finite()),
+                        "non-finite numeric value"
+                    );
+                }
             }
             Self::Float2(t) if numeric => ensure_finite(t)?,
             Self::Float3(t) if numeric => ensure_finite(t)?,

@@ -88,11 +88,11 @@ ACTION 的 `server_durations.queue` 从回调接收时刻计到 worker 内 predi
 
 部署配置负责通用 schema、semantics、执行和网络约束；ACT 支持的固定 state/image/action 特征由 ACT 模块的纯校验函数维护，策略构建在读取 checkpoint 和预热之前校验，并在最终通告合约上复用。checkpoint 数值不变量在构造模块前校验，归一化缓冲在预热前校验；不合法输入返回启动错误。
 
-`model.policy=echo|act|smolvla` 选择实现，`model.repo_or_path` 为本地原生 bpk checkpoint 目录；`model.device=auto|flex|metal` 显式选择 Burn 后端。ACT 与 SmolVLA 的预测/执行步数默认取 checkpoint，`execution.n_action_steps` 可限制执行片段；echo 的步数在示例中显式声明。配置中不支持的字段或取值在启动时拒绝。
+`model.policy=zero|act|smolvla` 选择实现，`model.repo_or_path` 为本地原生 bpk checkpoint 目录；`model.device=auto|flex|metal` 显式选择 Burn 后端。ACT 与 SmolVLA 的预测/执行步数默认取 checkpoint，`execution.n_action_steps` 可限制执行片段；zero 的步数在示例中显式声明。配置中不支持的字段或取值在启动时拒绝。
 
 | profile | state | 相机 | action | action_interval | semantics |
 |---|---|---|---|---|---|
-| `so101.toml`（echo 冒烟） | 6×f32 | front 480×640×3 u8 | 6×f32 | 1/30 | `so101-degrees-gripper-percent-v1` |
+| `so101.toml`（zero 冒烟） | 6×f32 | front 480×640×3 u8 | 6×f32 | 1/30 | `so101-degrees-gripper-percent-v1` |
 | `aloha_sim.toml`（仿真主线） | 14×f32 | top 480×640×3 u8 | 14×f32 | 1/50 | `aloha-sim-14d-v1` |
 
 `aloha_sim` 的 `prediction_steps`/`execution_steps` 从 checkpoint `config.json` 的 `chunk_size`/`n_action_steps` 读取，不二次发明。图像 resize/归一化等预处理归 Burn 侧（对照 lerobot processor 管线实现），Python 端只发环境原图。
@@ -113,7 +113,7 @@ LIBERO 闭环由 `scripts/libero_benchmark.py` 驱动官方 `LiberoEnv` 和 `Lib
 
 | # | 交付 | 通过判据 |
 |---|---|---|
-| M1 | `aloha_sim` profile + so101 回归 | `integration_smoke.py` 验证 so101 echo 生命周期与全零动作；ALOHA ACT 由 checkpoint parity 和仿真 harness 验证；`cargo test` 绿 |
+| M1 | `aloha_sim` profile + so101 回归 | `integration_smoke.py` 验证 so101 zero 生命周期与全零动作；ALOHA ACT 由 checkpoint parity 和仿真 harness 验证；`cargo test` 绿 |
 | M2 | Burn ACT 移植 + safetensors 加载 | `scripts/dump_act_reference.py` 生成参照产物，ignored 测试 `act_parity` 对齐 Burn `run` 与 Python `predict_action_chunk`+Unnormalize（f32 容差 ~1e-4；实测 max abs diff 3e-7）；`act_bisect_stages` 按 backbone/encoder 分段定位 |
 | M3 | 仿真 harness `scripts/sim_rollout.py` | aloha env ↔ 官方 `RemoteClient` 闭环（connect→admit→infer→step）；rollout CLI 是 robot-only、eval 不接 remote，此 harness 即「无硬件全链路」正式替身；记录 roundtrip 与任务成功率 |
 | M4 | GPU 后端 | `BURN_DEVICE=metal` 下 parity 与 M3 重跑通过，给出延迟对比（实测 parity 2.7e-7；worker med 317→48ms，6.6×；成功率 metal 3/5 vs flex 4/5，5-ep 小样本，混沌敏感） |

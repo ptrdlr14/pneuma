@@ -10,7 +10,7 @@ pub mod transformer;
 use burn::module::Module;
 use burn::nn::conv::Conv2d;
 use burn::nn::{Linear, LinearConfig};
-use burn::tensor::{Device, DeviceKind, Tensor, TensorData};
+use burn::tensor::{Device, Tensor, TensorData};
 
 use crate::contract::FeatureSpec;
 use crate::policy::Policy;
@@ -330,11 +330,7 @@ impl ActPolicy {
 
     fn init_model(path: &std::path::Path, backend: crate::config::Device) -> anyhow::Result<Self> {
         let cfg = config::parse(&path.join("config.json"))?;
-        let device = match backend {
-            crate::config::Device::Auto => Device::default(),
-            crate::config::Device::Flex => Device::flex(),
-            crate::config::Device::Metal => Device::metal(DeviceKind::default()),
-        };
+        let device = backend.into();
         let model = cfg.init(&device);
         Ok(Self { model, cfg, device })
     }
@@ -485,17 +481,11 @@ fn observation_batch(state: &[f32], image: &[u8]) -> Batch {
         values: [
             (
                 "observation.state".into(),
-                Data::F32 {
-                    values: state.to_vec(),
-                    shape: vec![14],
-                },
+                Data::f32(state.to_vec(), vec![14]),
             ),
             (
                 "observation.images.top".into(),
-                Data::U8 {
-                    values: image.to_vec(),
-                    shape: vec![480, 640, 3],
-                },
+                Data::u8(image.to_vec(), vec![480, 640, 3]),
             ),
         ]
         .into(),
@@ -667,13 +657,9 @@ mod numerical_tests {
         };
         let canonical: Vec<f32> = (0..42).map(|i| (i % 14) as f32 + 6.0).collect();
         let mut batch = observation_batch(&[5.0; 14], &vec![0; 480 * 640 * 3]);
-        batch.values.insert(
-            "action".into(),
-            Data::F32 {
-                values: canonical.clone(),
-                shape: vec![3, 14],
-            },
-        );
+        batch
+            .values
+            .insert("action".into(), Data::f32(canonical.clone(), vec![3, 14]));
         let mut normalized = pre.run(batch, &context).unwrap();
         let action = normalized.take("action").unwrap().into_float3().unwrap();
         assert_eq!(action.dims(), [1, 3, 14]);

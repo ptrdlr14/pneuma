@@ -181,12 +181,21 @@ impl Server {
             .artifact_identity
             .clone()
             .unwrap_or_else(|| match self.cfg.model.policy {
-                crate::config::Policy::Echo => "pneuma-echo-v0".into(),
-                crate::config::Policy::Act => {
+                crate::policy::PolicyKind::Zero => "pneuma-zero-v0".into(),
+                crate::policy::PolicyKind::Act => {
                     format!("pneuma-act:{}", self.cfg.model.repo_or_path.display())
                 }
-                crate::config::Policy::Smolvla => {
+                crate::policy::PolicyKind::Smolvla => {
                     format!("pneuma-smolvla:{}", self.cfg.model.repo_or_path.display())
+                }
+                crate::policy::PolicyKind::Pi05 => {
+                    format!("pneuma-pi05:{}", self.cfg.model.repo_or_path.display())
+                }
+                crate::policy::PolicyKind::Cosmos3Edge => {
+                    format!(
+                        "pneuma-cosmos3-edge:{}",
+                        self.cfg.model.repo_or_path.display()
+                    )
                 }
             })
     }
@@ -1372,7 +1381,7 @@ mod tests {
                 anyhow::bail!("gated failure")
             } else {
                 crate::policy::Policy::predict(
-                    &crate::policy::ZeroActionPolicy {
+                    &crate::policy::zero::ZeroActionPolicy {
                         steps: 50,
                         dim: 6,
                         device: burn::prelude::Device::flex(),

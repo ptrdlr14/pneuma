@@ -1,9 +1,9 @@
-# SO-101 协议冒烟：echo 返回全零动作，仅用于无动作联调。
+# SO-101 协议冒烟：zero 返回全零动作，仅用于无动作联调。
 deployment = "manipulation"
 semantics = "so101-degrees-gripper-percent-v1"
 
 [model]
-policy = "echo"
+policy = "zero"
 device = "auto"
 
 [execution]

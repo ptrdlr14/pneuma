@@ -1,0 +1,7 @@
+{
+    "env": {
+        "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "80",
+        "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "512000",
+        "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "512000"
+    }
+}

@@ -310,11 +310,7 @@ impl SmolVlaPolicy {
             !cfg.add_image_special_tokens,
             "SmolVLA add_image_special_tokens=true is not supported"
         );
-        let device = match backend {
-            crate::config::Device::Auto => Device::default(),
-            crate::config::Device::Flex => Device::flex(),
-            crate::config::Device::Metal => Device::metal(Default::default()),
-        };
+        let device = backend.into();
         let model = VLAFlowMatching::init(&cfg, &vlm, &device);
         Ok(Self { model, cfg, device })
     }

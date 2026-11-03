@@ -2,6 +2,7 @@
 
 use std::{collections::HashMap, fmt, path::Path};
 
+use crate::policy::PolicyKind;
 use anyhow::{Context, Result, ensure};
 use serde::{
     Deserialize, Deserializer,
@@ -90,7 +91,7 @@ pub(super) struct SmolVlaConfig {
 impl Default for SmolVlaConfig {
     fn default() -> Self {
         Self {
-            policy_type: "smolvla".into(),
+            policy_type: PolicyKind::Smolvla.as_str().into(),
             input_features: Vec::new(),
             output_features: Vec::new(),
             n_obs_steps: 1,
@@ -151,7 +152,10 @@ impl SmolVlaConfig {
     }
 
     fn validate(&mut self) -> Result<()> {
-        ensure!(self.policy_type == "smolvla", "expected type=smolvla");
+        ensure!(
+            self.policy_type == PolicyKind::Smolvla.as_str(),
+            "expected type=smolvla"
+        );
         ensure!(self.n_obs_steps == 1, "SmolVLA supports only n_obs_steps=1");
         ensure!(self.use_cache, "SmolVLA requires use_cache=true");
         ensure!(self.rtc_config.is_none(), "SmolVLA RTC is unsupported");

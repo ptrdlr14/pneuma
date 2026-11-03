@@ -1,34 +1,93 @@
 //! TOML 部署配置与完整性校验；CLI 在加载后直接覆盖常用启动字段。
 
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 
 use crate::contract::FeatureSpec;
+use crate::policy::PolicyKind;
 use crate::protocol::{Capabilities, deployment_prefix};
 
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Policy {
-    Echo,
-    Act,
-    Smolvla,
-}
+/// NVIDIA GPU 的硬件序号；`cuda` 无后缀时由后端自选（通常 0 号卡）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CudaIndex(pub Option<usize>);
 
-#[derive(Clone, Copy, Debug, Default, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Device {
     #[default]
     Auto,
     Flex,
     Metal,
+    /// NVIDIA GPU；`CudaIndex(None)` 由后端自选。
+    Cuda(CudaIndex),
+}
+
+impl Device {
+    pub const CUDA_DEFAULT: Device = Device::Cuda(CudaIndex(None));
+}
+
+/// 所有策略共用一处映射，避免各模型各自分支。
+impl From<Device> for burn::tensor::Device {
+    fn from(device: Device) -> Self {
+        use burn::tensor::{Device as Burn, DeviceIndex, DeviceKind};
+        // `Auto` 由 Burn 按 CUDA → Metal → ROCm → … 顺序挑选已编译的后端，
+        // 并接受 BURN_DEVICE 覆盖；这里不重复那份顺序。
+        match device {
+            Device::Auto => Burn::default(),
+            Device::Flex => Burn::flex(),
+            Device::Metal => Burn::metal(DeviceKind::default()),
+            Device::Cuda(CudaIndex(index)) => Burn::cuda(match index {
+                Some(index) => DeviceIndex::Specified(index),
+                None => DeviceIndex::Default,
+            }),
+        }
+    }
+}
+
+/// 与 PyTorch `cuda`、`cuda:7` 同一套写法，不接受其它分隔符或空白。
+impl FromStr for Device {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let (kind, index) = match value.split_once(':') {
+            Some((kind, index)) => {
+                // `cuda:` 写了冒号却没给序号，多半是笔误；当成 `cuda` 会跑到非预期的卡上。
+                ensure!(!index.is_empty(), "device index is empty in {value:?}");
+                (kind, Some(index))
+            }
+            None => (value, None),
+        };
+        let index = index
+            .map(|index| {
+                index
+                    .parse::<usize>()
+                    .with_context(|| format!("invalid device index in {value:?}"))
+            })
+            .transpose()?;
+        Ok(match kind {
+            "auto" => Device::Auto,
+            "flex" => Device::Flex,
+            "metal" => Device::Metal,
+            "cuda" => Device::Cuda(CudaIndex(index)),
+            other => anyhow::bail!("unknown device {other:?}"),
+        })
+    }
+}
+
+/// 手写实现以接受 `cuda:7`；`#[serde(rename_all)]` 无法表达带参数的变体。
+impl<'de> Deserialize<'de> for Device {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
-    pub policy: Policy,
+    pub policy: PolicyKind,
     #[serde(default)]
     pub repo_or_path: PathBuf,
     #[serde(default)]
@@ -43,7 +102,7 @@ pub struct ExecutionConfig {
     pub action_deadline_s: f64,
     pub idle_timeout_s: f64,
     pub warmup_calls: usize,
-    /// 模型策略从 checkpoint 读取；echo 必须显式给出预测步数。
+    /// 模型策略从 checkpoint 读取；zero 必须显式给出预测步数。
     pub prediction_steps: Option<u64>,
     pub n_action_steps: Option<u64>,
 }
@@ -82,7 +141,7 @@ pub struct ServerConfig {
     pub zenoh: ZenohConfig,
     pub features: Vec<FeatureSpec>,
     pub action_feature: FeatureSpec,
-    /// echo 的固定身份；模型策略未指定时由策略名与本地 checkpoint 路径派生。
+    /// zero 的固定身份；模型策略未指定时由策略名与本地 checkpoint 路径派生。
     #[serde(default)]
     pub artifact_identity: Option<String>,
 }
@@ -141,11 +200,11 @@ impl ServerConfig {
         );
         self.validate_features()?;
         match self.model.policy {
-            Policy::Echo => ensure!(
+            PolicyKind::Zero => ensure!(
                 execution.prediction_steps.is_some(),
-                "echo requires execution.prediction_steps"
+                "zero requires execution.prediction_steps"
             ),
-            Policy::Act | Policy::Smolvla => {
+            PolicyKind::Act | PolicyKind::Smolvla | PolicyKind::Pi05 | PolicyKind::Cosmos3Edge => {
                 ensure!(
                     !self.model.repo_or_path.as_os_str().is_empty(),
                     "model policy requires model.repo_or_path"
@@ -297,7 +356,7 @@ mod tests {
             ("execution.action_fps", toml::Value::String("abc".into())),
             ("execution.n_action_steps", toml::Value::Integer(51)),
             ("execution.warmup_calls", toml::Value::Integer(0)),
-            ("model.device", toml::Value::String("cuda".into())),
+            ("model.device", toml::Value::String("vulkan".into())),
             ("zenoh.mode", toml::Value::String("router".into())),
             ("execution.typo", toml::Value::Integer(1)),
         ] {
@@ -313,5 +372,64 @@ mod tests {
             assert!(format!("{error:#}").contains(field), "{key}: {error:#}");
         }
         assert!(ServerConfig::parse(&SO101.replace("shape = [6]", "shpae = [6]")).is_err());
+    }
+
+    #[test]
+    fn cuda_is_accepted_by_config() {
+        // CUDA 后端在 Cargo.toml 中始终启用，`cuda` 和 `cuda:N` 都是合法取值。
+        let config = ServerConfig::parse(&SO101.replace("device = \"auto\"", "device = \"cuda\""))
+            .expect("device=cuda must parse");
+        assert_eq!(config.model.device, Device::CUDA_DEFAULT);
+    }
+
+    #[test]
+    fn device_parses_pytorch_style_cuda_index() {
+        // 与 PyTorch 同一套写法：无后缀由后端自选，`:N` 指定硬件序号。
+        for (text, expected) in [
+            ("auto", Device::Auto),
+            ("flex", Device::Flex),
+            ("metal", Device::Metal),
+            ("cuda", Device::CUDA_DEFAULT),
+            ("cuda:7", Device::Cuda(CudaIndex(Some(7)))),
+            ("cuda:0", Device::Cuda(CudaIndex(Some(0)))),
+        ] {
+            assert_eq!(
+                text.parse::<Device>()
+                    .unwrap_or_else(|e| panic!("{text}: {e}")),
+                expected
+            );
+        }
+        // 无效写法要报错，不能被当成 auto 静默通过。
+        for bad in ["vulkan", "cuda:", "cuda:x", "cuda:-1", "cuda:1:2", "CUDA:7"] {
+            assert!(bad.parse::<Device>().is_err(), "{bad} must be rejected");
+        }
+    }
+
+    #[test]
+    fn toml_accepts_cuda_index() {
+        let config =
+            ServerConfig::parse(&SO101.replace("device = \"auto\"", "device = \"cuda:7\""))
+                .expect("device=cuda:7 must parse");
+        assert_eq!(config.model.device, Device::Cuda(CudaIndex(Some(7))));
+    }
+
+    /// 后端真机自检：解析 `PNEUMA_DEVICE`（默认 `cuda`），建设备并跑一次矩阵乘。
+    /// 运行：`PNEUMA_DEVICE=cuda:0 cargo test -- --ignored device_backend_runs_a_matmul --nocapture`
+    #[test]
+    #[ignore = "需要真实设备；用 PNEUMA_DEVICE 指定后端"]
+    fn device_backend_runs_a_matmul() {
+        use burn::tensor::Tensor;
+
+        let text = std::env::var("PNEUMA_DEVICE").unwrap_or_else(|_| "cuda".into());
+        let device = text
+            .parse::<Device>()
+            .unwrap_or_else(|e| panic!("PNEUMA_DEVICE={text}: {e}"))
+            .into();
+
+        // 全 1 的 [2,3] 乘全 2 的 [3,2]，每个元素应为 3×2 = 6。
+        let a = Tensor::<2>::ones([2, 3], &device);
+        let b = Tensor::<2>::ones([3, 2], &device) * 2.0;
+        let got = a.matmul(b).into_data().try_to_vec::<f32>().unwrap();
+        assert_eq!(got, vec![6.0; 4], "{text}");
     }
 }

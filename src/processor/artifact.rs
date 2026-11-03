@@ -202,6 +202,7 @@ impl Pipeline {
                 max_length,
                 padding,
                 padding_side,
+                ..
             } = &mut step
             {
                 let mut files = BTreeMap::new();

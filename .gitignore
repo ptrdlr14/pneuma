@@ -7,8 +7,6 @@ __pycache__/
 *.py[cod]
 
 # 本地工具设置和系统文件
-/.cluade/
-/.desloppify/
 .DS_Store
 
 # 由 scripts/dump_act_reference.py 生成的模型对齐数据
@@ -16,3 +14,13 @@ __pycache__/
 
 # 仿真评测结果和服务日志
 /outputs/
+
+# mise 个人覆盖（本地路径、私钥）；mise.toml 本身要提交
+/mise.local.toml
+
+# >>> magpie: library skills placed here (magpie adds and removes these lines) >>>
+/.claude/skills/burn
+/.claude/skills/mise
+/.claude/skills/rust-review
+/.mcp.json
+# <<< magpie <<<

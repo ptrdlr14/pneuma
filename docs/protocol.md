@@ -5,7 +5,7 @@
 Pneuma 实现 LeRobot **remote-inference v1** 协议（Zenoh + MessagePack），通过官方
 `RemoteClient` 接收观测并返回动作块。ACT 后端用 Burn 执行 ResNet18 与 Transformer，
 直接加载本地 safetensors checkpoint，提供 Flex CPU 和 Metal GPU 推理。
-`model.policy=echo` 返回全零动作块，用于协议与会话冒烟；策略扩展边界是 `policy::PolicyRunner`。
+`model.policy=zero` 返回全零动作块，用于协议与会话冒烟；策略扩展边界是 `policy::PolicyRunner`。
 
 协议事实对齐 LeRobot main @ `f9e9d739e`（2026-10-22）：`src/lerobot/remote_inference/`
 与 `src/lerobot/inference/contracts.py`。边界与路线决策见 [DESIGN.md](../DESIGN.md)（开发期可推翻快照）。

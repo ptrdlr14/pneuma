@@ -6,9 +6,9 @@ use anyhow::{Result, ensure};
 use burn::prelude::Device;
 
 use crate::{
-    config::{Policy as PolicyKind, ServerConfig},
+    config::ServerConfig,
     inference::PolicyRunner,
-    policy::{self, Policy, ZeroActionPolicy},
+    policy::{self, Policy, PolicyKind, zero::ZeroActionPolicy},
     processor::{Batch, DType, Data, Field, Layout, Pipeline, Schema},
     protocol::Capabilities,
 };
@@ -18,8 +18,8 @@ type Loaded = (Box<dyn Policy>, Pipeline, Pipeline, Device, u64, u64);
 
 pub fn build(cfg: &ServerConfig) -> Result<(Arc<PolicyRunner>, Capabilities)> {
     let loaded = match cfg.model.policy {
-        PolicyKind::Echo => None,
-        PolicyKind::Act | PolicyKind::Smolvla => {
+        PolicyKind::Zero => None,
+        PolicyKind::Act | PolicyKind::Smolvla | PolicyKind::Pi05 | PolicyKind::Cosmos3Edge => {
             if matches!(cfg.model.policy, PolicyKind::Act) {
                 policy::act::validate_contract(&cfg.features, &cfg.action_feature)?;
             }
@@ -36,11 +36,11 @@ pub fn build(cfg: &ServerConfig) -> Result<(Arc<PolicyRunner>, Capabilities)> {
         loaded
     } else {
         match cfg.model.policy {
-            PolicyKind::Echo => {
+            PolicyKind::Zero => {
                 let prediction = cfg
                     .execution
                     .prediction_steps
-                    .ok_or_else(|| anyhow::anyhow!("echo requires execution.prediction_steps"))?;
+                    .ok_or_else(|| anyhow::anyhow!("zero requires execution.prediction_steps"))?;
                 let steps = usize::try_from(prediction)?;
                 let dim = usize::try_from(cfg.action_feature.shape[0])?;
                 ensure!(
@@ -74,7 +74,9 @@ pub fn build(cfg: &ServerConfig) -> Result<(Arc<PolicyRunner>, Capabilities)> {
                     prediction,
                 )
             }
-            PolicyKind::Act | PolicyKind::Smolvla => unreachable!("model checkpoint loaded above"),
+            PolicyKind::Act | PolicyKind::Smolvla | PolicyKind::Pi05 | PolicyKind::Cosmos3Edge => {
+                unreachable!("model checkpoint loaded above")
+            }
         }
     };
     let execution = cfg.execution.n_action_steps.unwrap_or(default_steps);
@@ -118,7 +120,7 @@ fn load_checkpoint(cfg: &ServerConfig) -> Result<Loaded> {
     {
         PolicyKind::Act => {
             ensure!(
-                artifact.policy_kind == "act",
+                artifact.policy_kind == PolicyKind::Act,
                 "artifact policy differs from deployment"
             );
             policy::act::validate_contract(&cfg.features, &cfg.action_feature)?;
@@ -129,7 +131,7 @@ fn load_checkpoint(cfg: &ServerConfig) -> Result<Loaded> {
         }
         PolicyKind::Smolvla => {
             ensure!(
-                artifact.policy_kind == "smolvla",
+                artifact.policy_kind == PolicyKind::Smolvla,
                 "artifact policy differs from deployment"
             );
             let model = policy::smolvla::SmolVlaPolicy::load_model(
@@ -141,7 +143,31 @@ fn load_checkpoint(cfg: &ServerConfig) -> Result<Loaded> {
             let device = model.device();
             (Box::new(model), device, prediction, execution)
         }
-        PolicyKind::Echo => anyhow::bail!("echo does not load a model artifact"),
+        PolicyKind::Pi05 => {
+            ensure!(
+                artifact.policy_kind == PolicyKind::Pi05,
+                "artifact policy differs from deployment"
+            );
+            let model =
+                policy::pi05::Pi05Policy::load_model(&artifact.model_dir, cfg.model.device)?;
+            let (prediction, execution) = model.horizon();
+            let device = model.device();
+            (Box::new(model), device, prediction, execution)
+        }
+        PolicyKind::Cosmos3Edge => {
+            ensure!(
+                artifact.policy_kind == PolicyKind::Cosmos3Edge,
+                "artifact policy differs from deployment"
+            );
+            let model =
+                policy::cosmos3::Cosmos3Policy::load_model(&artifact.model_dir, cfg.model.device)?;
+            let action_dim = cfg.action_feature.shape.first().copied().unwrap_or(0) as usize;
+            let model = model.with_action_dim(action_dim);
+            let (prediction, execution) = model.horizon();
+            let device = model.device();
+            (Box::new(model), device, prediction, execution)
+        }
+        PolicyKind::Zero => anyhow::bail!("zero does not load a model artifact"),
     };
     Ok((
         model,
@@ -199,14 +225,8 @@ fn zero_observation(cfg: &ServerConfig) -> Result<Batch> {
             .try_fold(1usize, |n, &d| n.checked_mul(d))
             .ok_or_else(|| anyhow::anyhow!("warmup input size exceeds capacity"))?;
         let value = match feature.dtype.as_str() {
-            "uint8" => Data::U8 {
-                values: vec![0; count],
-                shape,
-            },
-            "float32" => Data::F32 {
-                values: vec![0.; count],
-                shape,
-            },
+            "uint8" => Data::u8(vec![0; count], shape),
+            "float32" => Data::f32(vec![0.; count], shape),
             other => anyhow::bail!("pipeline does not support input dtype {other}"),
         };
         batch.values.insert(feature.name.clone(), value);
@@ -219,7 +239,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn echo_produces_advertised_zero_actions() {
+    fn zero_produces_advertised_zero_actions() {
         let cfg = ServerConfig::load(std::path::Path::new("examples/so101.toml")).unwrap();
         let (runner, caps) = build(&cfg).unwrap();
         let chunk = runner.predict(zero_observation(&cfg).unwrap()).unwrap();
@@ -241,7 +261,7 @@ mod tests {
     }
 
     #[test]
-    fn echo_rejects_overflowing_action_size_at_startup() {
+    fn zero_rejects_overflowing_action_size_at_startup() {
         let mut cfg = ServerConfig::load(std::path::Path::new("examples/so101.toml")).unwrap();
         cfg.execution.prediction_steps = Some(u64::MAX);
         let Err(error) = build(&cfg) else {

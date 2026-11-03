@@ -1,0 +1,129 @@
+# Pneuma 任务入口。
+#
+# 分工：本机（mac）只写代码和文档；构建、测试、检查、运行全部在 server1 执行。
+# 除 `sync` 外，所有 Rust 任务都先同步代码再 ssh 到 server1 跑，结果来自同一份代码。
+#
+# server1 环境（实测）：Ubuntu 22.04，192 核，CUDA 13.0，8× RTX PRO 5000 72GB，
+# rustc/cargo 1.99.1 在 ~/.cargo/bin（不在非交互 shell 默认 PATH 里）。
+#
+# `ulimit -n 65536`：非交互 ssh 的 fd 软上限只有 1024。冷编译时 cargo 按 192 核
+# 并行启动 rustc，合计 fd 会超过 1024，报 `Too many open files (os error 24)`。
+# 构建热了以后不再触发，但保留这一行可以让 `cargo clean` 后的重建正常完成。
+
+# ---------------------------------------------------------------------------
+# 同步
+# ---------------------------------------------------------------------------
+
+[tasks.sync]
+description = "同步代码到 server1（不含 target/.venv/outputs/.git/.claude）"
+run = "rsync -av --delete --exclude=target --exclude=.venv --exclude=outputs --exclude=.git --exclude=.claude --exclude=.mcp.json --exclude=__pycache__ ./ server1:/data/nvme1/luyawang/Github/pneuma/"
+
+# ---------------------------------------------------------------------------
+# Rust：构建与检查（全部在 server1）
+#
+# 每个任务一次 ssh：先同步，再在 server1 上执行。sync 放远程命令里而不是
+# depends，避免 check 这类组合任务重复同步三次。
+# ---------------------------------------------------------------------------
+
+[tasks.build]
+description = "server1：调试构建（Flex CPU）"
+run = "mise run sync && ssh server1 'export PATH=$HOME/.cargo/bin:$PATH; ulimit -n 65536; cd /data/nvme1/luyawang/Github/pneuma && cargo build'"
+
+[tasks."build:release"]
+description = "server1：发布构建（含 Flex / Metal / CUDA 后端）"
+run = "mise run sync && ssh server1 'export PATH=$HOME/.cargo/bin:$PATH; ulimit -n 65536; cd /data/nvme1/luyawang/Github/pneuma && cargo build --release'"
+
+[tasks.test]
+description = "server1：运行 Rust 测试"
+run = "mise run sync && ssh server1 'export PATH=$HOME/.cargo/bin:$PATH; ulimit -n 65536; cd /data/nvme1/luyawang/Github/pneuma && cargo test'"
+
+# 真实设备自检：本机 PNEUMA_DEVICE 决定用哪张卡（默认 cuda），在 server1 上跑被忽略的
+# device_backend_runs_a_matmul。只证明「设备能建起来并算对」，不覆盖模型加载。
+[tasks."test:device"]
+description = "server1：真实设备自检（PNEUMA_DEVICE=cuda:0 等，默认 cuda）"
+run = "mise run sync && ssh server1 \"export PATH=\\$HOME/.cargo/bin:\\$PATH; ulimit -n 65536; cd /data/nvme1/luyawang/Github/pneuma && PNEUMA_DEVICE=${PNEUMA_DEVICE:-cuda} cargo test --lib -- --ignored device_backend_runs_a_matmul --nocapture\""
+
+[tasks.lint]
+description = "server1：clippy + rustfmt（按 CI 口径告警为错误）"
+run = "mise run sync && ssh server1 'export PATH=$HOME/.cargo/bin:$PATH; ulimit -n 65536; cd /data/nvme1/luyawang/Github/pneuma && cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings'"
+
+[tasks.doc]
+description = "server1：构建文档并检查断链"
+run = "mise run sync && ssh server1 'export PATH=$HOME/.cargo/bin:$PATH; ulimit -n 65536; cd /data/nvme1/luyawang/Github/pneuma && RUSTDOCFLAGS=\"-D warnings\" cargo doc --no-deps'"
+
+[tasks.check]
+description = "server1：提交前全量检查（一次同步，lint + test + doc）"
+run = "mise run sync && ssh server1 'export PATH=$HOME/.cargo/bin:$PATH; ulimit -n 65536; cd /data/nvme1/luyawang/Github/pneuma && cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test && RUSTDOCFLAGS=\"-D warnings\" cargo doc --no-deps'"
+
+# ---------------------------------------------------------------------------
+# CLI 冒烟
+# ---------------------------------------------------------------------------
+
+[tasks.help]
+description = "server1：打印 CLI 帮助（serve / convert 子命令）"
+run = "mise run sync && ssh server1 'export PATH=$HOME/.cargo/bin:$PATH; ulimit -n 65536; cd /data/nvme1/luyawang/Github/pneuma && cargo run -- --help'"
+
+[tasks."serve:zero"]
+description = "server1：启动 zero 协议服务（全零动作，用于客户端冒烟）"
+run = "mise run sync && ssh server1 'export PATH=$HOME/.cargo/bin:$PATH; ulimit -n 65536; cd /data/nvme1/luyawang/Github/pneuma && cargo run -- serve --config=examples/so101.toml'"
+
+# ---------------------------------------------------------------------------
+# 模型下载（server1，ModelScope）
+#
+# server1 到 HuggingFace 不稳定；统一用 ModelScope CLI 下载。
+# `--local-dir` 直接落成普通目录，不用 HF 风格的 snapshots/<hash> 路径。
+# 用法：MODEL=lerobot/pi05_libero mise run fetch:model
+# ---------------------------------------------------------------------------
+
+[tasks."fetch:model"]
+description = "server1：ModelScope 下载模型（需 MODEL=owner/name）"
+run = "ssh server1 \"/home/luyawang/.local/share/mise/installs/pipx-modelscope/latest/bin/modelscope download --repo-type model ${MODEL:?请设置 MODEL=owner/name} --local-dir /data/nvme1/modelscope/${MODEL:?请设置 MODEL}\""
+
+[tasks."fetch:list"]
+description = "server1：查看已下载的 ModelScope 模型与占用"
+run = "ssh server1 'du -sh /data/nvme1/modelscope/*/* 2>/dev/null | sort -h'"
+
+# ---------------------------------------------------------------------------
+# Python：客户端冒烟与仿真评测
+#
+# 未就绪：server1 上没有 uv、没有 .venv、没有 LeRobot 源码（实测 python 3.10.12，
+# 而脚本要 3.12）。下面这些任务保留原样，等 server1 环境补齐后再改成远程执行；
+# 现在跑会失败，不要据此判断代码有问题。
+# ---------------------------------------------------------------------------
+
+[tasks."setup:venv"]
+description = "创建 .venv 并安装 LeRobot remote 依赖（需要 LEROBOT_SRC）"
+run = """
+uv venv .venv --python 3.12
+uv pip install -p .venv/bin/python -e "${LEROBOT_SRC}[remote]"
+"""
+
+[tasks."smoke:client"]
+description = "官方 Python 客户端冒烟（需先启动 serve:zero）"
+depends = ["setup:venv"]
+run = ".venv/bin/python scripts/integration_smoke.py"
+
+[tasks."smoke:checkpoint"]
+description = "原生 bpk checkpoint 端到端冒烟（需要 PNEUMA_CHECKPOINT）"
+run = ".venv/bin/python scripts/checkpoint_smoke.py --checkpoint=${PNEUMA_CHECKPOINT}"
+
+[tasks."check:conversion"]
+description = "官方权重与转换结果逐值比对（需要 PNEUMA_SRC / PNEUMA_CHECKPOINT）"
+run = """
+.venv/bin/python scripts/check_conversion.py \
+  --source=${PNEUMA_SRC} --converted=${PNEUMA_CHECKPOINT}
+"""
+
+[tasks."bench:aloha"]
+description = "ALOHA ACT 闭环配对评测（需要 PNEUMA_ACT_CKPT）"
+run = """
+.venv/bin/python scripts/sim_rollout.py --backend=all --episodes=50 \
+  --output=outputs/aloha-paired.json
+"""
+
+[tasks."bench:libero"]
+description = "LIBERO SmolVLA 闭环评测（需要 PNEUMA_SMOLVLA_NATIVE）"
+run = """
+.venv/bin/python scripts/libero_benchmark.py --backend=all \
+  --output=outputs/libero.json
+"""

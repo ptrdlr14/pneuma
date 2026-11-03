@@ -46,7 +46,7 @@ flowchart TD
 | `multi_task_dit` | 多任务 DiT | 2 步观测 + 语言 | DiT 去噪 | CLIP ViT-B/16（598 MB） | **0.88 GB** | 未开始 |
 | `xvla` | XVLA，soft prompt + 动作 hub | 多视角 RGB + state + 语言 | flow matching / 离散 | Florence-2（3.1 GB）+ BART（1.0 GB） | **3.52 GB** | 未开始 |
 | `pi0` | π₀，Gemma + flow matching 专家 | 多视角 RGB + state + 语言 | flow matching | PaliGemma-3B（11.7 GB） | **7.0 / 14.0 GB** | 未开始 |
-| `pi05` | π₀.₅，AdaRMS 时间条件 | 多视角 RGB + state + 语言 | flow matching | PaliGemma-3B（11.7 GB） | **7.5 / 14.5 GB** | 未开始 |
+| `pi05` | π₀.₅，AdaRMS 时间条件 | 多视角 RGB + state + 语言 | flow matching | PaliGemma-3B（11.7 GB） | **7.5 / 14.5 GB** | **已实现** |
 | `groot` | GR00T N1.7 | 多视角 RGB + state + 语言 | DiT 流匹配 | Cosmos-Reason2-2B（4.9 GB，需 `base_model_path`） | **7.6 GB** | 未开始 |
 | `wall_oss_05` | Wall-OSS-0.5（4B） | 多视角 RGB + state + 语言 | flow matching | Qwen2.5-VL（7.5 GB） | **8.3 GB** | 未开始 |
 | `eo1` | EO-1 | 多视角 RGB + state + 语言 | flow matching | Qwen2.5-VL | **7.6 GB** | 未开始 |
@@ -129,8 +129,9 @@ VQ 码本缓存。反过来 `diffusion`（1.05 GB）虽不是最小，但无外�
 
 ## Pneuma 已实现部分
 
-`config::Policy` 目前只有 `echo`、`act`、`smolvla` 三个取值，其中 `echo` 返回全零动作块，
-只用于协议与会话冒烟。加载路径要求 `model.repo_or_path` 指向原生 bpk checkpoint，
+`policy::PolicyKind` 是策略类型的唯一定义，取值 `zero`、`act`、`smolvla`、`pi05`、`cosmos3_edge`。
+部署配置的 `policy`、checkpoint 清单的 `policy_kind`、命令行 `--policy` 都用这一个枚举，
+字符串形式由 `as_str()` 给出。其中 `zero` 返回全零动作块，只用于协议与会话冒烟。加载路径要求 `model.repo_or_path` 指向原生 bpk checkpoint，
 外部 LeRobot 目录必须先过 `pneuma convert`。
 
 ### ACT（`src/policy/act/`）
@@ -155,6 +156,18 @@ VQ 码本缓存。反过来 `diffusion`（1.05 GB）虽不是最小，但无外�
 - 约束：只支持 SmolVLM2-500M 架构（hidden 960 / 15 头 / vocab 49280 / 图像 512 / patch 16 / scale 4）；
   图像必须 resize 到 512×512；`add_image_special_tokens=true` 明确拒绝。
 - 数值：与官方权重做过固定噪声逐值对比，见 [SmolVLA](smolvla.md)。
+
+### π₀.₅（`src/policy/pi05/`）
+
+- 结构：`vision.rs` 为 SigLIP-So400m（27 层、1152 宽、patch 14、224×224）、
+  `gemma.rs` 为 Gemma 层（RMSNorm / adaRMS / gated MLP）、`model.rs` 为前缀缓存与联合去噪。
+- 参数：官方 checkpoint 带 `model.` 前缀（v044）或不带（`pi05_libero`），导入时按 safetensors
+  头部检测；`lm_head` 与 `embed_tokens` 绑定，导入时重映射，导出时还原。
+- 输入：状态按 MEAN_STD 归一化后离散化为 256 桶写入提示词；动作块 50 步、内部宽度 32，
+  输出裁剪到 7 维再反归一化。
+- 约束：只支持 `gemma_2b` + `gemma_300m`；不支持 RTC、相对动作与历史观测记忆。
+- 验证：真实权重加载、一次 10 步前向与官方 Python 逐值对齐均已通过；
+  动作最大绝对误差 9.8e-3、均值 2.7e-4，见 [π₀.₅](pi05.md)。
 
 ### 共享基础设施
 
@@ -198,7 +211,7 @@ VQ 码本缓存。反过来 `diffusion`（1.05 GB）虽不是最小，但无外�
 
 上游增加或删除策略时，按 `src/lerobot/policies/*/configuration_*.py` 里的
 `register_subclass` 取 `type`，按 `modeling_*.py` 判断是否 `from_pretrained` 外部模型，
-然后更新清单与 Pneuma 列。Pneuma 侧以 `config::Policy` 和 `src/policy/` 子目录为准。
+然后更新清单与 Pneuma 列。Pneuma 侧以 `policy::PolicyKind` 和 `src/policy/` 子目录为准。
 
 大小用 HF API 重新取，不要抄旧值：
 

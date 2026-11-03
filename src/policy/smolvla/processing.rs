@@ -205,6 +205,8 @@ pub(super) fn import_pipelines(
             max_length: token_config.max_length,
             padding: token_config.padding,
             padding_side: token_config.padding_side,
+            special_tokens: true,
+            negative: None,
         },
     ]);
     for (key, axis, width) in [
@@ -592,13 +594,9 @@ mod tests {
         )
         .unwrap();
         let mut batch = Batch::default();
-        batch.values.insert(
-            "image".into(),
-            Data::U8 {
-                values: data,
-                shape: vec![h, w, 3],
-            },
-        );
+        batch
+            .values
+            .insert("image".into(), Data::u8(data, vec![h, w, 3]));
         pipeline
             .run(batch, &context())
             .unwrap()
@@ -780,19 +778,10 @@ mod tests {
         fn batch(&self, task: &str, targets: Option<Vec<f32>>) -> Batch {
             let mut batch = Batch {
                 values: BTreeMap::from([
-                    (
-                        "observation.state".into(),
-                        Data::F32 {
-                            values: vec![3.0; 6],
-                            shape: vec![6],
-                        },
-                    ),
+                    ("observation.state".into(), Data::f32(vec![3.0; 6], vec![6])),
                     (
                         "observation.images.camera".into(),
-                        Data::U8 {
-                            values: vec![0; 45],
-                            shape: vec![3, 5, 3],
-                        },
+                        Data::u8(vec![0; 45], vec![3, 5, 3]),
                     ),
                 ]),
                 tasks: vec![task.into()],
@@ -800,10 +789,7 @@ mod tests {
             if let Some(values) = targets {
                 batch.values.insert(
                     "action".into(),
-                    Data::F32 {
-                        shape: vec![values.len() / 2, 2],
-                        values,
-                    },
+                    Data::f32(values.clone(), vec![values.len() / 2, 2]),
                 );
             }
             batch

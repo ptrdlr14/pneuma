@@ -2,7 +2,9 @@
 
 [返回 README](../README.md) · [协议与支持范围](protocol.md) · [ALOHA 评测](benchmarks.md)
 
-以下命令均在仓库根目录执行。
+以下命令均在仓库根目录执行。工具链与常用命令也提供 mise 任务：
+`mise install` 装好 Rust 与 uv，`mise tasks ls` 列出全部任务，
+`mise run build` / `mise run test` / `mise run check` 对应下方的构建与检查命令。
 
 ## 启动服务
 
@@ -33,15 +35,21 @@ cargo run --release -- serve --config=examples/aloha_sim.toml \
 ## 配置与命令行
 
 `model`、`execution`、`zenoh` 字段分组及 `features`、`action_feature` 命名与 LeRobot 对齐。
-Pneuma 扩展 `model.policy=echo|act|smolvla`；`model.repo_or_path` 当前只接受本地 checkpoint，
-`model.device=auto|flex|metal` 对应 Burn 后端（`auto` 使用 Burn 默认设备）。
+Pneuma 扩展 `model.policy=zero|act|smolvla|pi05`；`model.repo_or_path` 当前只接受本地 checkpoint，
+`model.device=auto|flex|metal|cuda|cuda:N` 对应 Burn 后端，三个后端始终编译进二进制。
+`auto` 按 CUDA → Metal → … 顺序挑选，也接受 `BURN_DEVICE` 环境变量。
+`cuda` 由后端自选卡号，`cuda:N` 指定第 N 号卡（同 PyTorch 写法，例如 `cuda:0`）。
+卡号越界不会静默回退到 CPU：CubeCL 在首次使用该设备时报错。
+无 CUDA 运行时的机器上，`auto` 会选到其它已编译后端。
 ACT 与 SmolVLA 的预测步数与默认执行步数来自 checkpoint，`execution.n_action_steps` 可覆盖执行步数；
-echo 要求显式声明 `execution.prediction_steps`。`execution.warmup_calls` 默认为 2。
-[so101.toml](../examples/so101.toml) 为 echo 零动作协议冒烟，
+π₀.₅ 同样从 `chunk_size` 与 `n_action_steps` 读取预测和执行步数。
+zero 要求显式声明 `execution.prediction_steps`。`execution.warmup_calls` 默认为 2。
+[so101.toml](../examples/so101.toml) 为 zero 零动作协议冒烟，
 [aloha_sim.toml](../examples/aloha_sim.toml) 为 14 维 ACT 仿真合约。
 [smolvla_libero.toml](../examples/smolvla_libero.toml) 为 SmolVLA 合约模板，
 导入时通过 `convert --vlm-path` 指定本地 VLM 资源，转换后资源归原生 checkpoint 所有。
-服务只加载 `.bpk` 原生 checkpoint。准备要求见 [SmolVLA 指南](smolvla.md)。
+[pi05_libero.toml](../examples/pi05_libero.toml) 为 π₀.₅ 合约模板，`--vlm-path` 指向 PaliGemma
+分词器目录；权重缺归一化统计时转换会明确失败。准备要求见 [π₀.₅ 指南](pi05.md)。
 路径相对进程工作目录解析，含空格的路径应给整个 CLI 参数加 shell 引号。
 
 `zenoh.config_file` 可指定 JSON5 安全配置底座（TLS、证书、ACL），
@@ -74,7 +82,7 @@ uv venv .venv --python 3.12
 uv pip install -p .venv/bin/python -e "<lerobot 仓>[remote]"
 ```
 
-在一个终端启动 echo 服务：
+在一个终端启动 zero 服务：
 
 ```sh
 cargo run -- serve --config=examples/so101.toml
@@ -86,12 +94,12 @@ cargo run -- serve --config=examples/so101.toml
 .venv/bin/python scripts/integration_smoke.py
 ```
 
-脚本验证全零动作、reset/Stale 和 close/reopen。echo 只用于协议验证。
+脚本验证全零动作、reset/Stale 和 close/reopen。zero 只用于协议验证。
 
 ## LeRobot rollout 接入
 
 下面的命令展示 SO-101 客户端所需的参数；机器人端口、相机配置和服务端地址需按实际环境填写。
-SO-101 示例服务使用 echo，返回全零动作，不提供操控策略。
+SO-101 示例服务使用 zero，返回全零动作，不提供操控策略。
 
 ```sh
 lerobot-rollout \

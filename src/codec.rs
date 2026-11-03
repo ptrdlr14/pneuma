@@ -58,6 +58,11 @@ impl Limits {
     }
 }
 
+/// 宿主数据构造失败（长度与形状不符）属于畸形输入。
+fn shape_error(error: anyhow::Error) -> ProtocolError {
+    ProtocolError::new(ErrorCode::Malformed, error.to_string())
+}
+
 fn malformed<T>(msg: &str) -> Result<T, ProtocolError> {
     Err(ProtocolError::new(ErrorCode::Malformed, msg))
 }
@@ -278,7 +283,7 @@ pub fn tensor_record(dtype: &str, shape: &[u64], data: Vec<u8>) -> Value {
     ])
 }
 
-/// f32 小端平铺，供 echo 桩构造 float32 动作块。
+/// f32 小端平铺，供 zero 桩构造 float32 动作块。
 pub fn f32_le(values: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(values.len() * 4);
     for v in values {
@@ -314,12 +319,9 @@ pub fn observation_batch(
                 ProtocolError::new(ErrorCode::Malformed, "feature shape exceeds platform size")
             })?;
         let data = match record.dtype.as_str() {
-            "uint8" => Data::U8 {
-                values: record.data.to_vec(),
-                shape,
-            },
-            "float32" => Data::F32 {
-                values: record
+            "uint8" => Data::try_u8(record.data.to_vec(), shape).map_err(shape_error)?,
+            "float32" => Data::try_f32(
+                record
                     .data
                     .as_chunks::<4>()
                     .0
@@ -327,7 +329,8 @@ pub fn observation_batch(
                     .map(|bytes| f32::from_le_bytes(*bytes))
                     .collect(),
                 shape,
-            },
+            )
+            .map_err(shape_error)?,
             other => {
                 return Err(ProtocolError::new(
                     ErrorCode::Incompatible,

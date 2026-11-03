@@ -10,7 +10,7 @@ use tokenizers::{
 
 use super::{
     Batch, Context, Data,
-    step::{MASK, TOKENS},
+    step::{MASK, NEGATIVE, TOKENS},
 };
 
 #[derive(Debug)]
@@ -102,7 +102,13 @@ pub(super) fn from_files(
     Ok(Prepared { tokenizer, files })
 }
 
-pub(super) fn run(batch: &mut Batch, context: &Context, tokenizer: &Tokenizer) -> Result<()> {
+pub(super) fn run(
+    batch: &mut Batch,
+    context: &Context,
+    tokenizer: &Tokenizer,
+    special_tokens: bool,
+    negative: Option<&str>,
+) -> Result<()> {
     ensure!(
         !batch.tasks.is_empty(),
         "tokenizer requires a nonempty task batch"
@@ -114,7 +120,7 @@ pub(super) fn run(batch: &mut Batch, context: &Context, tokenizer: &Tokenizer) -
         );
     }
     let encodings = tokenizer
-        .encode_batch(batch.tasks.clone(), true)
+        .encode_batch(batch.tasks.clone(), special_tokens)
         .map_err(|e| anyhow::anyhow!("tokenizing task batch: {e}"))?;
     let length = encodings.first().context("empty token encoding")?.len();
     ensure!(
@@ -137,6 +143,19 @@ pub(super) fn run(batch: &mut Batch, context: &Context, tokenizer: &Tokenizer) -
             &context.device,
         )),
     );
+    if let Some(text) = negative {
+        let encoding = tokenizer
+            .encode(text, special_tokens)
+            .map_err(|e| anyhow::anyhow!("tokenizing negative prompt: {e}"))?;
+        let ids: Vec<i64> = encoding.get_ids().iter().map(|id| i64::from(*id)).collect();
+        batch.values.insert(
+            NEGATIVE.into(),
+            Data::Int2(Tensor::<2, Int>::from_data(
+                TensorData::new(ids.clone(), [1, ids.len()]),
+                &context.device,
+            )),
+        );
+    }
     batch.values.insert(
         MASK.into(),
         Data::Bool2(Tensor::<2, Bool>::from_data(

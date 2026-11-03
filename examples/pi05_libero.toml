@@ -1,0 +1,46 @@
+# π₀.₅ LIBERO 合约模板：2 路相机、8 维状态、7 维动作。
+# checkpoint 声明的 empty_camera_0 不要求客户端发送；它的注意力 mask 恒为 0。
+# 权重与统计取自 lerobot/pi05_libero_finetuned_v044（含 normalizer state_file）。
+deployment = "libero"
+semantics = "libero-end-effector-delta-v1"
+
+[model]
+policy = "pi05"
+repo_or_path = "/absolute/path/to/native/pi05-checkpoint"
+device = "cuda:0"
+
+[execution]
+supported_modes = ["chunk"]
+action_fps = 10.0
+action_deadline_s = 60.0
+warmup_calls = 1
+
+[zenoh]
+mode = "peer"
+listen_endpoints = ["tcp/127.0.0.1:7447"]
+
+[[features]]
+name = "observation.state"
+shape = [8]
+dtype = "float32"
+semantics = "libero-eef-position-axis-angle-gripper-qpos-v1"
+
+[[features]]
+name = "observation.images.image"
+shape = [256, 256, 3]
+dtype = "uint8"
+kind = "rgb"
+semantics = "libero-agentview-rgb-v1"
+
+[[features]]
+name = "observation.images.image2"
+shape = [256, 256, 3]
+dtype = "uint8"
+kind = "rgb"
+semantics = "libero-wrist-rgb-v1"
+
+[action_feature]
+name = "action"
+shape = [7]
+dtype = "float32"
+semantics = "libero-end-effector-delta-v1"
