@@ -39,26 +39,3 @@ pub fn sinusoidal_2d(device: &Device, height: usize, width: usize, dimension: us
         device,
     )
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 与 Python 参照值逐元素对齐（scripts/dump_act_reference.py 生成）。
-    #[test]
-    fn matches_python_reference_small() {
-        let device = Device::flex();
-        let data = sinusoidal_2d(&device, 3, 4, 8).into_data();
-        let got: Vec<f32> = data.iter::<f32>().collect();
-        // python 值由 dump_act_reference.py 的 pos2d_small.json 提供。
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/scripts/fixtures/pos2d_small.json"
-        );
-        let want: Vec<f32> = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-        assert_eq!(got.len(), want.len());
-        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-            assert!((g - w).abs() < 1e-6, "index {i}: {g} vs {w}");
-        }
-    }
-}

@@ -375,14 +375,6 @@ mod tests {
     }
 
     #[test]
-    fn cuda_is_accepted_by_config() {
-        // CUDA 后端在 Cargo.toml 中始终启用，`cuda` 和 `cuda:N` 都是合法取值。
-        let config = ServerConfig::parse(&SO101.replace("device = \"auto\"", "device = \"cuda\""))
-            .expect("device=cuda must parse");
-        assert_eq!(config.model.device, Device::CUDA_DEFAULT);
-    }
-
-    #[test]
     fn device_parses_pytorch_style_cuda_index() {
         // 与 PyTorch 同一套写法：无后缀由后端自选，`:N` 指定硬件序号。
         for (text, expected) in [

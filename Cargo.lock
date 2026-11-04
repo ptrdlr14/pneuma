@@ -5435,6 +5435,7 @@ name = "pneuma"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bon",
  "burn",
  "burn-pack",
  "burn-store",

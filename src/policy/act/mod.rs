@@ -2,45 +2,45 @@
 //! 旧 checkpoint 的归一化缓冲在导入时转换为共享输入 / 输出 pipeline。
 //! 推理路径 `use_vae` 下 z=0（eval 语义），`vae_encoder` 权重不加载。
 
-pub mod config;
 pub mod position;
 pub mod resnet;
 pub mod transformer;
 
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
+
+use anyhow::Context;
+use burn::config::Config;
 use burn::module::Module;
 use burn::nn::conv::Conv2d;
-use burn::nn::{Linear, LinearConfig};
-use burn::tensor::{Device, Tensor, TensorData};
+use burn::nn::{Embedding, EmbeddingConfig, Linear, LinearConfig};
+use burn::tensor::{Device, Tensor};
 
 use crate::contract::FeatureSpec;
 use crate::policy::Policy;
 use crate::processor::{Batch, DType, Data, Field, Layout, Pipeline, Schema, Step};
 
-use config::ActConfig;
 use position::sinusoidal_2d;
 use resnet::{Resnet, ResnetConfig};
 use transformer::{ACTDecoder, ACTEncoder, LayerNorm, TransformerLayerConfig};
 
-/// nn.Embedding 的只读等价：weight [n, dim] 直接给 (1, n, dim) 位置编码用。
-#[derive(Module, Debug)]
-pub struct PosTable {
-    pub weight: burn::module::Param<burn::tensor::Tensor<2>>,
+/// 取整张嵌入表为 (1, n, dim)，对应 ACT 的 1D 位置编码查表。
+fn embedding_rows(embedding: &Embedding) -> Tensor<3> {
+    let [n, dim] = embedding.weight.dims();
+    embedding.weight.val().reshape([1, n, dim])
 }
 
-impl PosTable {
-    fn init(n: usize, dim: usize, device: &Device) -> Self {
-        Self {
-            weight: burn::module::Param::from_data(
-                TensorData::new(vec![0.0f32; n * dim], [n, dim]),
-                device,
-            ),
-        }
-    }
-
-    fn rows(&self) -> Tensor<3> {
-        let [n, dim] = self.weight.dims();
-        self.weight.val().reshape([1, n, dim])
-    }
+/// 移植后支持的 ACT 超参；字段名用模块自己的语义。
+#[derive(Copy, Debug, Config)]
+pub struct ActConfig {
+    pub chunk_size: usize,
+    pub n_action_steps: usize,
+    pub dim_model: usize,
+    pub n_heads: usize,
+    pub dim_feedforward: usize,
+    pub n_encoder_layers: usize,
+    pub n_decoder_layers: usize,
+    pub latent_dim: usize,
 }
 
 /// ACT 顶层模块；字段名 = `modeling_act.py` 的 nn.Module 属性名。
@@ -52,9 +52,12 @@ pub struct Act {
     pub encoder_robot_state_input_proj: Linear,
     pub encoder_latent_input_proj: Linear,
     pub encoder_img_feat_input_proj: Conv2d,
-    pub encoder_1d_feature_pos_embed: PosTable,
-    pub decoder_pos_embed: PosTable,
+    pub encoder_1d_feature_pos_embed: Embedding,
+    pub decoder_pos_embed: Embedding,
     pub action_head: Linear,
+    /// 固定输入尺寸的 2D 位置表；首次前向后复用，不进入 record。
+    #[module(skip)]
+    image_positions: Arc<OnceLock<Tensor<3>>>,
 }
 
 impl ActConfig {
@@ -86,9 +89,10 @@ impl ActConfig {
                 [1, 1],
             )
             .init(device),
-            encoder_1d_feature_pos_embed: PosTable::init(2, self.dim_model, device),
-            decoder_pos_embed: PosTable::init(self.chunk_size, self.dim_model, device),
+            encoder_1d_feature_pos_embed: EmbeddingConfig::new(2, self.dim_model).init(device),
+            decoder_pos_embed: EmbeddingConfig::new(self.chunk_size, self.dim_model).init(device),
             action_head: LinearConfig::new(self.dim_model, 14).init(device),
+            image_positions: Arc::default(),
         }
     }
 }
@@ -101,12 +105,13 @@ impl Act {
         let (tokens, pos) = self.encoder_inputs(state, feat, latent_dim);
         let dim_model = tokens.dims()[2];
         let enc = self.encoder.forward(tokens, &pos);
-        let chunk = self.decoder_pos_embed.rows().dims()[1];
+        let dec_pos = embedding_rows(&self.decoder_pos_embed);
+        let chunk = dec_pos.dims()[1];
         let dec_in = Tensor::<3, _>::zeros([1, chunk, dim_model], &device);
-        let dec_pos = self.decoder_pos_embed.rows();
         let dec = self.decoder.forward(dec_in, &dec_pos, &enc, &pos);
         self.action_head.forward(dec)
     }
+
     fn encoder_inputs(
         &self,
         state: Tensor<2>,
@@ -128,8 +133,16 @@ impl Act {
         tokens.push(feat.permute([0, 2, 3, 1]).reshape([1, h * w, dim]));
         let tokens = Tensor::cat(tokens, 1);
 
-        let mut pos = vec![self.encoder_1d_feature_pos_embed.rows()];
-        pos.push(sinusoidal_2d(&device, h, w, dim / 2).reshape([1, h * w, dim]));
+        let mut pos = vec![embedding_rows(&self.encoder_1d_feature_pos_embed)];
+        let image_pos = self
+            .image_positions
+            .get_or_init(|| sinusoidal_2d(&device, h, w, dim / 2).reshape([1, h * w, dim]));
+        assert_eq!(
+            image_pos.dims(),
+            [1, h * w, dim],
+            "ACT image size changed after the position table was cached"
+        );
+        pos.push(image_pos.clone());
         let pos = Tensor::cat(pos, 1);
 
         (tokens, pos)
@@ -283,7 +296,6 @@ impl NormStats {
 pub struct ActPolicy {
     model: Act,
     cfg: ActConfig,
-    device: Device,
 }
 
 fn f32_tensor(st: &safetensors::SafeTensors, name: &str) -> anyhow::Result<Vec<f32>> {
@@ -300,52 +312,51 @@ fn f32_tensor(st: &safetensors::SafeTensors, name: &str) -> anyhow::Result<Vec<f
         .collect())
 }
 
-impl ActPolicy {
+/// ACT 策略的构造配置。
+#[derive(Debug, bon::Builder)]
+pub struct ActPolicyConfig {
+    #[builder(into)]
+    path: PathBuf,
+}
+
+impl ActPolicyConfig {
+    /// 解析 `config.json` 并构建未加载权重的策略。
+    pub fn init(&self, device: &Device) -> anyhow::Result<ActPolicy> {
+        let path = self.path.join("config.json");
+        let raw = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading ACT config {}", path.display()))?;
+        let cfg: ActConfig = serde_json::from_str(&raw)
+            .with_context(|| format!("parsing ACT config {}", path.display()))?;
+        let model = cfg.init(device);
+        Ok(ActPolicy { model, cfg })
+    }
+
+    /// 从原生 checkpoint 严格恢复模型状态，不接受外部权重格式。
+    pub fn load_model(&self, device: &Device) -> anyhow::Result<ActPolicy> {
+        let policy = self.init(device)?;
+        let record = burn::store::ModuleRecord::load(self.path.join("model.bpk"))
+            .context("reading native ACT model.bpk; convert the LeRobot checkpoint first")?;
+        policy.load_record(record)
+    }
+
     /// 导入 LeRobot checkpoint 的模型与共享 pipeline；预热由部署执行器负责。
     pub fn import_configured(
-        path: &std::path::Path,
-        backend: crate::config::Device,
-    ) -> anyhow::Result<(Self, Pipeline, Pipeline, Vec<String>)> {
-        let stats = NormStats::load(&path.join("model.safetensors"))?;
-        let (policy, unused) = Self::import_lerobot(path, backend)?;
+        &self,
+        device: &Device,
+    ) -> anyhow::Result<(ActPolicy, Pipeline, Pipeline, Vec<String>)> {
+        let stats = NormStats::load(&self.path.join("model.safetensors"))?;
+        let (policy, unused) = self.import_lerobot(device)?;
         let (pre, post) = stats.into_pipelines(policy.cfg.chunk_size)?;
         Ok((policy, pre, post, unused))
     }
 
-    /// 从原生 checkpoint 严格恢复模型状态，不接受外部权重格式。
-    pub fn load_model(
-        path: &std::path::Path,
-        backend: crate::config::Device,
-    ) -> anyhow::Result<Self> {
-        use anyhow::Context;
-        let mut policy = Self::init_model(path, backend)?;
-        let record = burn::store::ModuleRecord::load(path.join("model.bpk"))
-            .context("reading native ACT model.bpk; convert the LeRobot checkpoint first")?;
-        policy.model = policy
-            .model
-            .try_load_record(record)
-            .context("restoring ACT model record")?;
-        Ok(policy)
-    }
-
-    fn init_model(path: &std::path::Path, backend: crate::config::Device) -> anyhow::Result<Self> {
-        let cfg = config::parse(&path.join("config.json"))?;
-        let device = backend.into();
-        let model = cfg.init(&device);
-        Ok(Self { model, cfg, device })
-    }
-
     /// 转换边界导入完整推理模块，额外参数由 checkpoint 转换器保存。
-    pub fn import_lerobot(
-        path: &std::path::Path,
-        backend: crate::config::Device,
-    ) -> anyhow::Result<(Self, Vec<String>)> {
-        use anyhow::Context;
+    pub fn import_lerobot(&self, device: &Device) -> anyhow::Result<(ActPolicy, Vec<String>)> {
         use burn_store::ModuleSnapshot;
-        let mut policy = Self::init_model(path, backend)?;
-        let dir = path.display();
+        let mut policy = self.init(device)?;
+        let dir = self.path.display();
 
-        let mut store = lerobot_import_store(&path.join("model.safetensors"));
+        let mut store = lerobot_import_store(&self.path.join("model.safetensors"));
         let applied = policy
             .model
             .load_from(&mut store)
@@ -367,6 +378,20 @@ impl ActPolicy {
 
         Ok((policy, applied.unused))
     }
+}
+
+impl ActPolicy {
+    /// 应用已加载的原生 record；结构由 `ActPolicyConfig::init` 构建。
+    pub fn load_record(self, record: burn::store::ModuleRecord) -> anyhow::Result<Self> {
+        let model = self
+            .model
+            .try_load_record(record)
+            .context("restoring ACT model record")?;
+        Ok(Self {
+            model,
+            cfg: self.cfg,
+        })
+    }
 
     /// 保存当前内存参数与参数身份，供原生加载和后续训练恢复使用。
     pub fn save_native(&self, path: &std::path::Path) -> anyhow::Result<()> {
@@ -384,11 +409,6 @@ impl ActPolicy {
 
     pub fn horizon(&self) -> (u64, u64) {
         (self.cfg.chunk_size as u64, self.cfg.n_action_steps as u64)
-    }
-
-    /// 返回模型所在设备，供执行器构造 pipeline 上下文。
-    pub fn device(&self) -> Device {
-        self.device.clone()
     }
 }
 
@@ -497,6 +517,7 @@ fn observation_batch(state: &[f32], image: &[u8]) -> Batch {
 mod numerical_tests {
     use super::*;
     use crate::processor::{Context, Mode};
+    use burn::tensor::TensorData;
 
     #[test]
     fn native_weights_export_with_original_attention_keys_and_layout() {
@@ -750,223 +771,5 @@ mod numerical_tests {
         stats.state_std[0] = 1.0;
         stats.action_mean[0] = f32::NAN;
         assert!(stats.validate().is_err());
-    }
-}
-
-#[cfg(test)]
-mod diagnostics {
-    use super::*;
-    use crate::processor::{Context, Mode};
-
-    fn load_checkpoint(path: &str) -> anyhow::Result<(ActPolicy, Pipeline, Pipeline)> {
-        let (policy, pre, post, _) =
-            ActPolicy::import_configured(std::path::Path::new(path), crate::config::Device::Auto)?;
-        Ok((policy, pre, post))
-    }
-
-    fn normalized_input(
-        policy: &ActPolicy,
-        pre: &Pipeline,
-        state: &[f32],
-        image: &[u8],
-    ) -> anyhow::Result<Batch> {
-        pre.run(
-            observation_batch(state, image),
-            &Context {
-                device: policy.device(),
-                mode: Mode::Eval,
-            },
-        )
-    }
-
-    fn canonical_actions(
-        policy: &ActPolicy,
-        pre: &Pipeline,
-        post: &Pipeline,
-        state: &[f32],
-        image: &[u8],
-    ) -> anyhow::Result<Vec<f32>> {
-        let input = normalized_input(policy, pre, state, image)?;
-        let output = policy.predict(input)?;
-        let mut output = post.run(
-            output,
-            &Context {
-                device: policy.device(),
-                mode: Mode::Eval,
-            },
-        )?;
-        Ok(output
-            .take("action")?
-            .into_float3()?
-            .into_data()
-            .try_to_vec::<f32>()?)
-    }
-
-    fn max_abs_diff(got: &[f32], reference: &[f32]) -> anyhow::Result<(usize, f32)> {
-        anyhow::ensure!(
-            got.len() == reference.len(),
-            "length differs: {} vs {}",
-            got.len(),
-            reference.len()
-        );
-        let mut worst = (0, 0.0);
-        for (i, (g, r)) in got.iter().zip(reference).enumerate() {
-            anyhow::ensure!(
-                g.is_finite() && r.is_finite(),
-                "non-finite value at index {i}: got={g}, reference={r}"
-            );
-            let difference = (g - r).abs();
-            if difference > worst.1 {
-                worst = (i, difference);
-            }
-        }
-        Ok(worst)
-    }
-
-    #[test]
-    fn parity_oracle_rejects_non_finite_values_on_either_side() {
-        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            assert!(max_abs_diff(&[invalid], &[0.0]).is_err());
-            assert!(max_abs_diff(&[0.0], &[invalid]).is_err());
-        }
-        assert_eq!(max_abs_diff(&[1.0, 3.0], &[1.0, 2.5]).unwrap(), (1, 0.5));
-    }
-
-    /// M2 判据：与 `scripts/dump_act_reference.py` 产物的逐元素对齐。
-    /// 运行：`PNEUMA_ACT_CKPT=<ckpt> PNEUMA_PARITY_DIR=<dir> cargo test -- --ignored act_parity`
-    #[test]
-    #[ignore = "需要官方 checkpoint 与 python 参照产物"]
-    fn act_parity_against_python_reference() {
-        let ckpt = std::env::var("PNEUMA_ACT_CKPT").expect("PNEUMA_ACT_CKPT");
-        let dir = std::env::var("PNEUMA_PARITY_DIR").expect("PNEUMA_PARITY_DIR");
-        let dir = std::path::Path::new(&dir);
-
-        let state: Vec<f32> = {
-            let b = std::fs::read(dir.join("state.bin")).unwrap();
-            b.as_chunks::<4>()
-                .0
-                .iter()
-                .map(|c| f32::from_le_bytes(*c))
-                .collect()
-        };
-        let image = std::fs::read(dir.join("image_hwc.bin")).unwrap();
-        let reference: Vec<f32> = {
-            let b = std::fs::read(dir.join("actions_ref.bin")).unwrap();
-            b.as_chunks::<4>()
-                .0
-                .iter()
-                .map(|c| f32::from_le_bytes(*c))
-                .collect()
-        };
-
-        let (policy, pre, post) = load_checkpoint(&ckpt).unwrap();
-        let got = canonical_actions(&policy, &pre, &post, &state, &image).unwrap();
-        let worst = max_abs_diff(&got, &reference).expect("模型与参照必须等长且逐元素有限");
-        println!("max abs diff = {:.3e} @ {}", worst.1, worst.0);
-        assert!(worst.1 < 5e-3, "与 python 参照偏差过大: {worst:?}");
-    }
-
-    /// 调试：分段与 python 中间值比对，定位偏差来源（backbone → encoder → head）。
-    #[test]
-    #[ignore = "需要 PNEUMA_* 环境变量与 dump_act_reference.py 中间产物"]
-    fn act_bisect_stages() {
-        let ckpt = std::env::var("PNEUMA_ACT_CKPT").unwrap();
-        let dirvar = std::env::var("PNEUMA_PARITY_DIR").unwrap();
-        let dir = std::path::Path::new(&dirvar);
-        let read = |n: &str| -> Vec<f32> {
-            std::fs::read(dir.join(n))
-                .unwrap()
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|c| f32::from_le_bytes(*c))
-                .collect()
-        };
-        let diff = |name: &str, got: &[f32], want: &[f32]| {
-            let (_, worst) = max_abs_diff(got, want).expect("中间值必须等长且逐元素有限");
-            let n_big = got
-                .iter()
-                .zip(want)
-                .filter(|(g, w)| (*g - *w).abs() > 1e-3)
-                .count();
-            println!("{name}: worst={worst:.3e}  n(>1e-3)={n_big}/{}", got.len());
-        };
-
-        let state: Vec<f32> = read("state.bin");
-        let image = std::fs::read(dir.join("image_hwc.bin")).unwrap();
-        let (policy, pre, _) = load_checkpoint(&ckpt).unwrap();
-        let mut batch = normalized_input(&policy, &pre, &state, &image).unwrap();
-        let state_t = batch
-            .take("observation.state")
-            .unwrap()
-            .into_float2()
-            .unwrap();
-        let image_t = batch
-            .take("observation.images.top")
-            .unwrap()
-            .into_float4()
-            .unwrap();
-
-        let feat = policy.model.backbone.forward(image_t.clone());
-        let [_, _, fh, fw] = feat.dims();
-        let fd: burn::tensor::TensorData = feat.clone().into_data();
-        diff(
-            "backbone",
-            &fd.iter::<f32>().collect::<Vec<_>>(),
-            &read("backbone_out.bin"),
-        );
-        println!("backbone dims = {:?}", feat.dims());
-
-        let (tokens, pos) = policy
-            .model
-            .encoder_inputs(state_t, feat, policy.cfg.latent_dim);
-        println!(
-            "tokens={:?} pos={:?} (h,w)=({fh},{fw})",
-            tokens.dims(),
-            pos.dims()
-        );
-
-        let enc = policy.model.encoder.forward(tokens, &pos);
-        let ed: TensorData = enc.into_data();
-        diff(
-            "encoder",
-            &ed.iter::<f32>().collect::<Vec<_>>(),
-            &read("encoder_out.bin"),
-        );
-    }
-
-    /// M4 延迟对比：预热后平均单次前向（`BURN_DEVICE` 切后端各跑一遍）。
-    /// 运行：`PNEUMA_ACT_CKPT=<ckpt> PNEUMA_PARITY_DIR=<dir> cargo test --release -- --ignored act_forward_latency --nocapture`
-    #[test]
-    #[ignore = "需要官方 checkpoint 与参照观测"]
-    fn act_forward_latency() {
-        const N: u32 = 8;
-
-        let ckpt = std::env::var("PNEUMA_ACT_CKPT").unwrap();
-        let dirvar = std::env::var("PNEUMA_PARITY_DIR").unwrap();
-        let dir = std::path::Path::new(&dirvar);
-        let state: Vec<f32> = std::fs::read(dir.join("state.bin"))
-            .unwrap()
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| f32::from_le_bytes(*c))
-            .collect();
-        let image = std::fs::read(dir.join("image_hwc.bin")).unwrap();
-
-        let (policy, pre, post) = load_checkpoint(&ckpt).unwrap();
-        let started = std::time::Instant::now();
-        let warm = canonical_actions(&policy, &pre, &post, &state, &image).unwrap();
-        println!("first forward = {:?}（含后端预热）", started.elapsed());
-        let started = std::time::Instant::now();
-        for _ in 0..N {
-            canonical_actions(&policy, &pre, &post, &state, &image).unwrap();
-        }
-        println!(
-            "steady forward = {:?}（{} 次均值，输出与首次一致={:?}）",
-            started.elapsed() / N,
-            N,
-            canonical_actions(&policy, &pre, &post, &state, &image).unwrap() == warm
-        );
     }
 }

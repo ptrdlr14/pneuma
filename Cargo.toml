@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+bon = "3.10.3"
 # flex = 纯 Rust CPU；metal = Apple GPU；cuda = NVIDIA，始终编译进二进制。
 # 运行时用 `--device` 或 BURN_DEVICE 选择：auto 按 CUDA → Metal → ROCm → … 顺序挑。
 burn = { version = "0.22.0-pre.3", default-features = false, features = ["std", "flex", "metal", "cuda", "autodiff"] }

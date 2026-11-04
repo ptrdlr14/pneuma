@@ -21,14 +21,14 @@ use crate::{
     config::Device,
     contract::FeatureSpec,
     policy::{
-        PolicyKind, act::ActPolicy, cosmos3::Cosmos3Policy, pi05::Pi05Policy,
-        smolvla::SmolVlaPolicy,
+        PolicyKind, act::ActPolicyConfig, cosmos3::Cosmos3PolicyConfig, pi05::Pi05PolicyConfig,
+        smolvla::SmolVlaPolicyConfig,
     },
     processor::Pipeline,
 };
 
 /// 转换边界使用整套 checkpoint 格式，而非单个文件扩展名。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Format {
     Lerobot,
     Pneuma,
@@ -109,7 +109,10 @@ fn import(options: &ConvertOptions) -> Result<()> {
     };
     match kind {
         PolicyKind::Act => {
-            let (model, pre, post, _) = ActPolicy::import_configured(&options.input, Device::Flex)?;
+            let (model, pre, post, _) = ActPolicyConfig::builder()
+                .path(&options.input)
+                .build()
+                .import_configured(&Device::Flex.into())?;
             save_import(
                 options,
                 kind,
@@ -122,13 +125,11 @@ fn import(options: &ConvertOptions) -> Result<()> {
         }
         PolicyKind::Smolvla => {
             let (features, action) = feature_contract(&config, options.features.as_deref())?;
-            let (model, pre, post, _) = SmolVlaPolicy::import_configured(
-                &options.input,
-                vlm.as_deref(),
-                Device::Flex,
-                &features,
-                &action,
-            )?;
+            let (model, pre, post, _) = SmolVlaPolicyConfig::new()
+                .path(&options.input)
+                .maybe_vlm_path(vlm.clone())
+                .build()
+                .import_configured(&features, &action, &Device::Flex.into())?;
             save_import(
                 options,
                 kind,
@@ -146,13 +147,12 @@ fn import(options: &ConvertOptions) -> Result<()> {
                 .into_iter()
                 .filter(|feature| !feature.name.starts_with("observation.images.empty_camera_"))
                 .collect();
-            let (model, pre, post, _) = Pi05Policy::import_configured(
-                &options.input,
-                vlm.as_deref(),
-                Device::Flex,
-                &features,
-                &action,
-            )?;
+            let (model, pre, post, _) = Pi05PolicyConfig::new()
+                .path(&options.input)
+                .maybe_vlm_path(vlm.clone())
+                .device(Device::Flex)
+                .build()
+                .import_configured(&features, &action)?;
             save_import(
                 options,
                 kind,
@@ -166,8 +166,11 @@ fn import(options: &ConvertOptions) -> Result<()> {
         PolicyKind::Cosmos3Edge => {
             let (features, action) = feature_contract(&config, options.features.as_deref())?;
             let tokenizer = options.input.join("tokenizer");
-            let (model, pre, post, _) =
-                Cosmos3Policy::import_configured(&options.input, Device::Flex, &features, &action)?;
+            let (model, pre, post, _) = Cosmos3PolicyConfig::new()
+                .path(&options.input)
+                .device(Device::Flex)
+                .build()
+                .import_configured(&features, &action)?;
             save_import(
                 options,
                 kind,
@@ -286,18 +289,24 @@ fn export(options: &ConvertOptions) -> Result<()> {
     checkpoint::staging(&options.output, |root| {
         let active = root.join("active.safetensors");
         match native.policy_kind {
-            PolicyKind::Act => {
-                ActPolicy::load_model(&native.model_dir, Device::Flex)?.export_lerobot(&active)?
-            }
-            PolicyKind::Smolvla => SmolVlaPolicy::load_model(
-                &native.model_dir,
-                native.vlm_path.as_deref(),
-                Device::Flex,
-            )?
-            .export_lerobot(&active)?,
-            PolicyKind::Pi05 => {
-                Pi05Policy::load_model(&native.model_dir, Device::Flex)?.export_lerobot(&active)?
-            }
+            PolicyKind::Act => ActPolicyConfig::builder()
+                .path(&native.model_dir)
+                .build()
+                .load_model(&Device::Flex.into())?
+                .export_lerobot(&active)?,
+            PolicyKind::Smolvla => SmolVlaPolicyConfig::new()
+                .path(&native.model_dir)
+                .maybe_vlm_path(native.vlm_path.clone())
+                .build()
+                .load_model(&Device::Flex.into())?
+                .export_lerobot(&active)?,
+            PolicyKind::Pi05 => Pi05PolicyConfig::new()
+                .path(&native.model_dir)
+                .maybe_vlm_path(native.vlm_path.clone())
+                .device(Device::Flex)
+                .build()
+                .load_model()?
+                .export_lerobot(&active)?,
             _ => bail!("unsupported native policy"),
         }
         merge_weights(

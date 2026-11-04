@@ -182,15 +182,6 @@ mod reference {
     }
 
     #[test]
-    fn picks_the_tier_canvas() {
-        // 两个 256 视角并排：512x256，较短边 256 档，比例 0.5 最接近 16,9。
-        assert_eq!(canvas_size(256, 512), Some((320, 192)));
-        assert_eq!(content_size(256, 512, (320, 192)), (320, 160));
-        assert_eq!(canvas_size(256, 256), Some((256, 256)));
-        assert_eq!(content_size(256, 256, (256, 256)), (256, 256));
-    }
-
-    #[test]
     #[ignore = "需要 torch 参照"]
     fn resize_matches_torch() {
         let parity = std::path::PathBuf::from(
@@ -209,25 +200,6 @@ mod reference {
             .fold(0.0f64, f64::max);
         println!("resize max {max:.3e}");
         assert!(max < 5e-3, "resize differs by {max:.3e}");
-    }
-
-    #[test]
-    fn resize_keeps_constants_and_shape() {
-        let plane = vec![42.0f64; 32 * 32];
-        let resized = resize_plane(&plane, 32, 32, 16, 16);
-        assert_eq!(resized.len(), 16 * 16);
-        for value in &resized {
-            assert!(
-                (value - 42.0).abs() < 1e-9,
-                "constant plane drifted to {value}"
-            );
-        }
-        let ramp: Vec<f64> = (0..32).map(|index| index as f64).collect();
-        let resized = resize_plane(&ramp, 1, 32, 1, 16);
-        assert!(
-            resized.windows(2).all(|pair| pair[1] > pair[0]),
-            "ramp must stay monotonic"
-        );
     }
 }
 

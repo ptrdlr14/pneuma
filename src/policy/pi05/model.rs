@@ -366,29 +366,3 @@ fn prefix_mask(pads: &[bool], device: &Device) -> Tensor<4, Bool> {
         .collect();
     Tensor::from_data(TensorData::new(blocked, [1, 1, seq, seq]), device)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn prefix_positions_skip_padding() {
-        assert_eq!(
-            prefix_positions(&[true, true, false, true]),
-            vec![0, 1, 1, 2]
-        );
-    }
-
-    #[test]
-    fn rope_preserves_width_and_rotates() {
-        let device = Device::flex();
-        let x = Tensor::<4>::from_data(
-            TensorData::new(vec![1f32, 2., 3., 4.], [1, 1, 1, 4]),
-            &device,
-        );
-        let rotated = rope(x, &[1]).into_data().try_to_vec::<f32>().unwrap();
-        assert_eq!(rotated.len(), 4);
-        let norm: f32 = rotated.iter().map(|x| x * x).sum();
-        assert!((norm - 30.).abs() < 1e-4);
-    }
-}

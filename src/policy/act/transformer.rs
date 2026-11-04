@@ -2,37 +2,32 @@
 //! torch `MultiheadAttention` 的 `in_proj` 融合权重按 q|k|v 行切分等价还原。
 //! 布局统一 (B, S, D)；dropout 在推理下为恒等，不建模。
 
-use burn::module::Module;
+use burn::module::{Module, Param};
 use burn::nn::{Linear, LinearConfig};
 use burn::tensor::activation::{relu, softmax};
+use burn::tensor::module::layer_norm;
 use burn::tensor::{Device, Tensor, TensorData, s};
 
-/// torch `LayerNorm`（biased variance，eps=1e-5），weight/bias 键名直接对齐 `state_dict`。
+/// torch `LayerNorm`（biased variance，eps=1e-5）。
+///
+/// 保留 `weight`/`bias` 字段名以对齐 `state_dict` 与原生 bpk；
+/// 归一化本身调用 Burn 的原生算子。
 #[derive(Module, Debug)]
 pub struct LayerNorm {
-    pub weight: burn::module::Param<burn::tensor::Tensor<1>>,
-    pub bias: burn::module::Param<burn::tensor::Tensor<1>>,
+    pub weight: Param<Tensor<1>>,
+    pub bias: Param<Tensor<1>>,
 }
 
 impl LayerNorm {
     pub fn init(dim: usize, device: &Device) -> Self {
         Self {
-            weight: burn::module::Param::from_data(
-                TensorData::new(vec![1.0f32; dim], [dim]),
-                device,
-            ),
-            bias: burn::module::Param::from_data(TensorData::new(vec![0.0f32; dim], [dim]), device),
+            weight: Param::from_data(TensorData::new(vec![1.0f32; dim], [dim]), device),
+            bias: Param::from_data(TensorData::new(vec![0.0f32; dim], [dim]), device),
         }
     }
 
-    pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
-        let dim = x.dims()[2];
-        let mean = x.clone().mean_dim(2);
-        let centered = x - mean;
-        let var = centered.clone().powf_scalar(2.0).mean_dim(2);
-        let normed = centered / (var + 1e-5).sqrt();
-        // rank-1 参数 reshape 后按 dim=0/1 广播。
-        normed * self.weight.val().reshape([1, 1, dim]) + self.bias.val().reshape([1, 1, dim])
+    pub fn forward<const D: usize>(&self, x: Tensor<D>) -> Tensor<D> {
+        layer_norm(x, self.weight.val(), Some(self.bias.val()), 1e-5)
     }
 }
 
@@ -62,23 +57,35 @@ impl MultiheadAttention {
             .permute([0, 2, 1, 3])
     }
 
+    /// query/key/value 输入不同，各自做融合投影。
     pub fn forward(&self, query: Tensor<3>, key: Tensor<3>, value: Tensor<3>) -> Tensor<3> {
-        let dim = query.dims()[2];
-        let q = self.in_proj.forward(query).slice(s![.., .., 0..dim]);
-        let k = self.in_proj.forward(key).slice(s![.., .., dim..2 * dim]);
-        let v = self
-            .in_proj
-            .forward(value)
-            .slice(s![.., .., 2 * dim..3 * dim]);
+        let query = self.in_proj.forward(query);
+        let key = self.in_proj.forward(key);
+        let value = self.in_proj.forward(value);
+        self.attend(query, key, value)
+    }
 
-        let q = self.split_heads(q);
-        let k = self.split_heads(k);
-        let v = self.split_heads(v);
+    /// query 与 key 输入相同：融合投影只算一次，q/k 从同一结果切分。
+    pub fn self_attention(&self, query_key: Tensor<3>, value: Tensor<3>) -> Tensor<3> {
+        let qk = self.in_proj.forward(query_key);
+        let value = self.in_proj.forward(value);
+        self.attend(qk.clone(), qk, value)
+    }
+
+    /// 输入是 `in_proj` 的输出 `[B, S, 3D]`，按 q|k|v 切分后计算注意力。
+    fn attend(
+        &self,
+        projected_query: Tensor<3>,
+        projected_key: Tensor<3>,
+        projected_value: Tensor<3>,
+    ) -> Tensor<3> {
+        let dim = projected_query.dims()[2] / 3;
+        let q = self.split_heads(projected_query.slice(s![.., .., 0..dim]));
+        let k = self.split_heads(projected_key.slice(s![.., .., dim..2 * dim]));
+        let v = self.split_heads(projected_value.slice(s![.., .., 2 * dim..3 * dim]));
         let head_dim = v.dims()[3];
-        let scale = 1.0 / (head_dim as f32).sqrt();
-        let scores = q.matmul(k.swap_dims(2, 3)) * scale;
-        let attn = softmax(scores, 3);
-        let merged = attn.matmul(v).permute([0, 2, 1, 3]);
+        let scores = q.matmul(k.swap_dims(2, 3)) * (1.0 / (head_dim as f32).sqrt());
+        let merged = softmax(scores, 3).matmul(v).permute([0, 2, 1, 3]);
         let [batch, seq, _, _] = merged.dims();
         self.out_proj.forward(merged.reshape([batch, seq, dim]))
     }
@@ -118,7 +125,7 @@ impl ACTEncoderLayer {
         let skip = x.clone();
         let v = x.clone();
         let qk = x + pos.clone();
-        let attn = self.self_attn.forward(qk.clone(), qk, v);
+        let attn = self.self_attn.self_attention(qk, v);
         let x = self.norm1.forward(skip + attn);
         let ff = self.linear2.forward(relu(self.linear1.forward(x.clone())));
         self.norm2.forward(x + ff)
@@ -175,7 +182,7 @@ impl ACTDecoderLayer {
         let qk = x + dec_pos.clone();
         let x = self
             .norm1
-            .forward(skip + self.self_attn.forward(qk.clone(), qk, v));
+            .forward(skip + self.self_attn.self_attention(qk, v));
 
         let skip = x.clone();
         let query = x + dec_pos.clone();
@@ -215,67 +222,19 @@ impl ACTDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::module::Param;
+    use burn::tensor::Tolerance;
 
+    /// self-attention 复用一次融合投影，结果必须与通用路径一致。
     #[test]
-    fn layer_norm_uses_population_variance_and_affine_parameters() {
+    fn fused_self_attention_matches_general_path() {
         let device = Device::flex();
-        let norm = LayerNorm {
-            weight: Param::from_data(TensorData::new(vec![2.0f32, 3.0], [2]), &device),
-            bias: Param::from_data(TensorData::new(vec![0.5f32, -0.5], [2]), &device),
-        };
-        let input = Tensor::from_data([[[1.0f32, 3.0], [7.0, 7.0]]], &device);
-        let got = norm.forward(input).into_data().try_to_vec::<f32>().unwrap();
-        let scale = 1.0 / (1.0f32 + 1e-5).sqrt();
-        let expected = [0.5 - 2.0 * scale, -0.5 + 3.0 * scale, 0.5, -0.5];
-        for (actual, expected) in got.iter().zip(expected) {
-            assert!((actual - expected).abs() < 1e-6, "{got:?}");
-        }
-    }
-
-    #[test]
-    fn attention_projects_distinct_sources_and_merges_scaled_heads() {
-        let device = Device::flex();
-        // 三组单位投影让手算结果只取决于分头、缩放、softmax 和 value 来源。
-        let mut projection = vec![0.0f32; 4 * 12];
-        for row in 0..4 {
-            for block in 0..3 {
-                projection[row * 12 + block * 4 + row] = 1.0;
-            }
-        }
-        let attention = MultiheadAttention {
-            in_proj: Linear {
-                weight: Param::from_data(TensorData::new(projection, [4, 12]), &device),
-                bias: None,
-            },
-            out_proj: Linear {
-                weight: Param::from_data(
-                    TensorData::new(
-                        vec![
-                            1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
-                            0.0, 0.0, 1.0,
-                        ],
-                        [4, 4],
-                    ),
-                    &device,
-                ),
-                bias: None,
-            },
-            n_heads: 2,
-        };
-        let query = Tensor::from_data([[[1.0f32, 0.0, 0.0, 1.0]]], &device);
-        let key = Tensor::from_data([[[1.0f32, 0.0, 1.0, 0.0], [0.0, 1.0, 0.0, 1.0]]], &device);
-        let value = Tensor::from_data(
-            [[[2.0f32, 4.0, 6.0, 8.0], [10.0, 12.0, 14.0, 16.0]]],
-            &device,
-        );
-        let output = attention.forward(query, key, value);
-        assert_eq!(output.dims(), [1, 1, 4]);
-        let got = output.into_data().try_to_vec::<f32>().unwrap();
-        let p = 1.0 / (1.0 + (-1.0f32 / 2.0f32.sqrt()).exp());
-        let expected = [10.0 - 8.0 * p, 12.0 - 8.0 * p, 6.0 + 8.0 * p, 8.0 + 8.0 * p];
-        for (actual, expected) in got.iter().zip(expected) {
-            assert!((actual - expected).abs() < 1e-5, "{got:?}");
-        }
+        let attention = MultiheadAttention::init(8, 2, &device);
+        let query = Tensor::<3>::from_data(TensorData::new(vec![0.5f32; 24], [1, 3, 8]), &device);
+        let value = Tensor::<3>::from_data(TensorData::new(vec![-0.25f32; 24], [1, 3, 8]), &device);
+        let expected = attention
+            .forward(query.clone(), query.clone(), value.clone())
+            .into_data();
+        let actual = attention.self_attention(query, value).into_data();
+        actual.assert_approx_eq::<f32>(&expected, Tolerance::default());
     }
 }

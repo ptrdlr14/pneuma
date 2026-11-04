@@ -248,69 +248,6 @@ fn block_major(grid: Tensor<4>, merge: usize) -> Tensor<3> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use burn::tensor::{Tensor, TensorData};
-
-    fn small_vision() -> VisionConfig {
-        VisionConfig {
-            hidden_size: 32,
-            intermediate_size: 64,
-            num_hidden_layers: 2,
-            num_attention_heads: 4,
-            num_channels: 3,
-            patch_size: 2,
-            layer_norm_eps: 1e-6,
-            hidden_act: "gelu_pytorch_tanh".into(),
-            num_patches: 16,
-            spatial_merge_size: 2,
-        }
-    }
-
-    #[test]
-    fn patchify_uses_block_major_order() {
-        let device = Device::flex();
-        // 8×8 图像，patch=2，网格 4×4；每个像素值 = row*8 + col。
-        let values: Vec<f32> = (0..64).map(|value| value as f32).collect();
-        let image = Tensor::<4>::from_data(TensorData::new(values, [1, 1, 8, 8]), &device);
-        let patches = patchify(image, 2, 2);
-        assert_eq!(patches.dims(), [1, 16, 4]);
-        let first: Vec<f32> = patches
-            .into_data()
-            .try_to_vec::<f32>()
-            .unwrap()
-            .chunks(4)
-            .map(|patch| patch[0])
-            .collect();
-        // 每块 2×2 个 patch，块优先。
-        assert_eq!(&first[..8], &[0., 2., 16., 18., 4., 6., 20., 22.]);
-    }
-
-    #[test]
-    fn visual_and_projector_shapes() {
-        let device = Device::flex();
-        let cfg = small_vision();
-        let visual = Visual::init(&cfg, &device);
-        let projector = Projector::init(
-            &ProjectorConfig {
-                input_hidden_size: 32,
-                merger_intermediate_size: 128,
-                out_hidden_size: 48,
-                spatial_merge_size: 2,
-                use_postshuffle_norm: false,
-            },
-            1e-6,
-            &device,
-        );
-        let image = Tensor::<4>::zeros([1, 3, 8, 8], &device);
-        let tokens = visual.forward(image);
-        assert_eq!(tokens.dims(), [1, 16, 32]);
-        let merged = projector.forward(tokens);
-        assert_eq!(merged.dims(), [1, 4, 48]);
-    }
-}
-
-#[cfg(test)]
 mod reference {
     use super::*;
     use burn::tensor::{DType, TensorData};

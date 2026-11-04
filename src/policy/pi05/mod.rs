@@ -6,7 +6,7 @@ mod model;
 mod processing;
 mod vision;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
 use burn::module::Module;
@@ -36,51 +36,30 @@ pub struct Pi05Policy {
 const EMBEDDINGS: &str = "paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight";
 const LM_HEAD: &str = "paligemma_with_expert.paligemma.lm_head.weight";
 
-impl Pi05Policy {
-    pub fn import_configured(
-        path: &Path,
-        vlm_path: Option<&Path>,
-        backend: crate::config::Device,
-        features: &[FeatureSpec],
-        action: &FeatureSpec,
-    ) -> Result<(
-        Self,
-        crate::processor::Pipeline,
-        crate::processor::Pipeline,
-        Vec<String>,
-    )> {
-        let cfg = config::parse(&path.join("config.json"))?;
-        processing::validate_contract(&cfg, features, action)?;
-        let tokenizer_dir = vlm_path
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| path.join("vlm"));
-        let (preprocessor, postprocessor) =
-            processing::import_pipelines(path, &cfg, &tokenizer_dir)?;
-        let (policy, unused) = Self::import_lerobot(path, backend)?;
-        Ok((policy, preprocessor, postprocessor, unused))
+/// π₀.₅ 策略的构造配置。
+///
+/// 用 bon 生成具名 builder；`init` 只构建模型结构，
+/// 权重由 `Pi05Policy::load_record` 单独恢复。
+#[derive(Debug, bon::Builder)]
+#[builder(start_fn = new)]
+pub struct Pi05PolicyConfig {
+    #[builder(into)]
+    path: PathBuf,
+    vlm_path: Option<PathBuf>,
+    device: crate::config::Device,
+}
+
+impl Pi05PolicyConfig {
+    /// 解析 `config.json` 并构建未加载权重的策略。
+    pub fn init(&self) -> Result<Pi05Policy> {
+        self.init_with_prefix(source_prefix_from_interop(&self.path))
     }
 
-    /// 严格加载原生模型 record，外部 safetensors 必须先转换。
-    pub fn load_model(path: &Path, backend: crate::config::Device) -> Result<Self> {
-        let mut policy = Self::init_model(path, backend, source_prefix_from_interop(path))?;
-        let record = burn::store::ModuleRecord::load(path.join("model.bpk"))
-            .context("reading native pi05 model.bpk; convert the LeRobot checkpoint first")?;
-        policy.model = policy
-            .model
-            .try_load_record(record)
-            .context("restoring pi05 model record")?;
-        Ok(policy)
-    }
-
-    fn init_model(
-        path: &Path,
-        backend: crate::config::Device,
-        source_prefix: String,
-    ) -> Result<Self> {
-        let cfg = config::parse(&path.join("config.json"))?;
-        let device = backend.into();
+    fn init_with_prefix(&self, source_prefix: String) -> Result<Pi05Policy> {
+        let cfg = config::parse(&self.path.join("config.json"))?;
+        let device: Device = self.device.into();
         let model = Pi05Net::init(&cfg, &device)?;
-        Ok(Self {
+        Ok(Pi05Policy {
             model,
             cfg,
             device,
@@ -89,16 +68,43 @@ impl Pi05Policy {
         })
     }
 
+    /// 严格加载原生模型 record，外部 safetensors 必须先转换。
+    pub fn load_model(&self) -> Result<Pi05Policy> {
+        let policy = self.init()?;
+        let record = burn::store::ModuleRecord::load(self.path.join("model.bpk"))
+            .context("reading native pi05 model.bpk; convert the LeRobot checkpoint first")?;
+        policy.load_record(record)
+    }
+
+    pub fn import_configured(
+        &self,
+        features: &[FeatureSpec],
+        action: &FeatureSpec,
+    ) -> Result<(
+        Pi05Policy,
+        crate::processor::Pipeline,
+        crate::processor::Pipeline,
+        Vec<String>,
+    )> {
+        let cfg = config::parse(&self.path.join("config.json"))?;
+        processing::validate_contract(&cfg, features, action)?;
+        let tokenizer_dir = self
+            .vlm_path
+            .clone()
+            .unwrap_or_else(|| self.path.join("vlm"));
+        let (preprocessor, postprocessor) =
+            processing::import_pipelines(&self.path, &cfg, &tokenizer_dir)?;
+        let (policy, unused) = self.import_lerobot()?;
+        Ok((policy, preprocessor, postprocessor, unused))
+    }
+
     /// 转换边界导入 LeRobot 参数；未使用参数（专家 lm_head）留给 checkpoint 转换器保存。
-    pub fn import_lerobot(
-        path: &Path,
-        backend: crate::config::Device,
-    ) -> Result<(Self, Vec<String>)> {
-        let weights = path.join("model.safetensors");
+    pub fn import_lerobot(&self) -> Result<(Pi05Policy, Vec<String>)> {
+        let weights = self.path.join("model.safetensors");
         let names = tensor_names(&weights)?;
         let prefixed = names.iter().any(|name| name.starts_with("model."));
         let source_prefix = if prefixed { "model." } else { "" }.to_string();
-        let mut policy = Self::init_model(path, backend, source_prefix)?;
+        let mut policy = self.init_with_prefix(source_prefix)?;
         policy.tied_embeddings =
             !names.contains(EMBEDDINGS) && !names.contains(&format!("model.{EMBEDDINGS}"));
         let mut store = SafetensorsStore::from_file(&weights)
@@ -137,6 +143,23 @@ impl Pi05Policy {
             "pi05 weights imported"
         );
         Ok((policy, applied.unused))
+    }
+}
+
+impl Pi05Policy {
+    /// 应用已加载的原生 record；结构由 `Pi05PolicyConfig::init` 构建。
+    pub fn load_record(self, record: burn::store::ModuleRecord) -> Result<Self> {
+        let model = self
+            .model
+            .try_load_record(record)
+            .context("restoring pi05 model record")?;
+        Ok(Self {
+            model,
+            cfg: self.cfg,
+            device: self.device,
+            tied_embeddings: self.tied_embeddings,
+            source_prefix: self.source_prefix,
+        })
     }
 
     pub fn save_native(&self, path: &Path) -> Result<()> {
@@ -295,7 +318,13 @@ mod tests {
         let backend: crate::config::Device = device.parse().expect("PNEUMA_DEVICE");
         let artifact =
             crate::checkpoint::Checkpoint::load(Path::new(&path)).expect("loading pi05 checkpoint");
-        let policy = Pi05Policy::load_model(&artifact.model_dir, backend).expect("loading pi05");
+        let policy = Pi05PolicyConfig::new()
+            .path(&artifact.model_dir)
+            .maybe_vlm_path(artifact.vlm_path.clone())
+            .device(backend)
+            .build()
+            .load_model()
+            .expect("loading pi05");
         let resolved = policy.device();
         let mut batch = Batch::default();
         for (name, _) in policy.cfg.image_features() {
@@ -385,7 +414,13 @@ mod tests {
         let device = std::env::var("PNEUMA_DEVICE").unwrap_or_else(|_| "flex".into());
         let backend: crate::config::Device = device.parse().expect("PNEUMA_DEVICE");
         let artifact = crate::checkpoint::Checkpoint::load(Path::new(&native)).expect("checkpoint");
-        let policy = Pi05Policy::load_model(&artifact.model_dir, backend).expect("pi05");
+        let policy = Pi05PolicyConfig::new()
+            .path(&artifact.model_dir)
+            .maybe_vlm_path(artifact.vlm_path.clone())
+            .device(backend)
+            .build()
+            .load_model()
+            .expect("pi05");
         let device = policy.device();
         let manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(parity.join("manifest.json")).expect("manifest"))

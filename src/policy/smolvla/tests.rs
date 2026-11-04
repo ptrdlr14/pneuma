@@ -87,22 +87,20 @@ fn smolvla_parity() {
     let (policy, preprocessor, postprocessor) =
         if let Some(native) = std::env::var_os("PNEUMA_SMOLVLA_NATIVE") {
             let checkpoint = crate::checkpoint::Checkpoint::load(Path::new(&native)).unwrap();
-            let policy = SmolVlaPolicy::load_model(
-                &checkpoint.model_dir,
-                checkpoint.vlm_path.as_deref(),
-                backend,
-            )
-            .unwrap();
+            let policy = SmolVlaPolicyConfig::new()
+                .path(&checkpoint.model_dir)
+                .maybe_vlm_path(checkpoint.vlm_path.clone())
+                .build()
+                .load_model(&backend.into())
+                .unwrap();
             (policy, checkpoint.preprocessor, checkpoint.postprocessor)
         } else {
-            let (policy, pre, post, _) = SmolVlaPolicy::import_configured(
-                &dir.join("checkpoint"),
-                Some(&vlm),
-                backend,
-                &features,
-                &action,
-            )
-            .unwrap();
+            let (policy, pre, post, _) = SmolVlaPolicyConfig::new()
+                .path(dir.join("checkpoint"))
+                .vlm_path(vlm)
+                .build()
+                .import_configured(&features, &action, &backend.into())
+                .unwrap();
             (policy, pre, post)
         };
     let task = manifest["task"].as_str().unwrap_or("pick up the red cube");
@@ -211,9 +209,16 @@ fn smolvla_parity() {
         ),
         &policy.device,
     );
+    let mut expert_cache =
+        policy
+            .model
+            .vlm_with_expert
+            .lm_expert
+            .cache(&cache, &prefix_valid, cfg.chunk_size);
+    let time = policy.model.time_embedding(1.0, &cfg, &policy.device);
     let velocity = policy
         .model
-        .velocity(noise.clone(), 1., &cache, &prefix_valid, &cfg);
+        .velocity(noise.clone(), time, &mut expert_cache);
     compare(
         "velocity_step_0",
         &velocity.into_data().try_to_vec::<f32>().unwrap(),

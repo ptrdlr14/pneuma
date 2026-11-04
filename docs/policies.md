@@ -138,7 +138,7 @@ VQ 码本缓存。反过来 `diffusion`（1.05 GB）虽不是最小，但无外�
 
 - 结构：`resnet.rs` 移植 torchvision ResNet18（含 `FrozenBatchNorm2d` 语义）、
   `transformer.rs` 为 ACT 编解码器、`position.rs` 为位置编码。
-- 参数：`import_lerobot` 用 `PyTorchToBurnAdapter` 处理布局，并按键重映射
+- 参数：`ActPolicyConfig::import_lerobot` 用 `PyTorchToBurnAdapter` 处理布局，并按键重映射
   `model.` 前缀、`in_proj_weight/bias`、`downsample.0/1`；`allow_partial(true)` 放过了
   VAE 编码器等推理期不参与的参数，由 `convert` 存入 `interop/extra.bpk` 原样保留。
 - 合约：`validate_contract` 在启动时硬校验 `observation.state [14]`、

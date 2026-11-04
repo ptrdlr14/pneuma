@@ -20,6 +20,7 @@ __pycache__/
 
 # >>> magpie: library skills placed here (magpie adds and removes these lines) >>>
 /.claude/skills/burn
+/.claude/skills/diagram-design
 /.claude/skills/mise
 /.claude/skills/rust-review
 /.mcp.json

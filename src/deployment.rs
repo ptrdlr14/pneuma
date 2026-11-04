@@ -116,7 +116,7 @@ pub fn build(cfg: &ServerConfig) -> Result<(Arc<PolicyRunner>, Capabilities)> {
 
 fn load_checkpoint(cfg: &ServerConfig) -> Result<Loaded> {
     let artifact = crate::checkpoint::Checkpoint::load(&cfg.model.repo_or_path)?;
-    let (model, device, prediction, execution): (Box<dyn Policy>, _, _, _) = match cfg.model.policy
+    let (policy, device, prediction, execution): (Box<dyn Policy>, _, _, _) = match cfg.model.policy
     {
         PolicyKind::Act => {
             ensure!(
@@ -124,21 +124,28 @@ fn load_checkpoint(cfg: &ServerConfig) -> Result<Loaded> {
                 "artifact policy differs from deployment"
             );
             policy::act::validate_contract(&cfg.features, &cfg.action_feature)?;
-            let model = policy::act::ActPolicy::load_model(&artifact.model_dir, cfg.model.device)?;
-            let (prediction, execution) = model.horizon();
-            let device = model.device();
-            (Box::new(model), device, prediction, execution)
+            let policy = policy::act::ActPolicyConfig::builder()
+                .path(&artifact.model_dir)
+                .build()
+                .load_model(&cfg.model.device.into())?;
+            let (prediction, execution) = policy.horizon();
+            (
+                Box::new(policy),
+                cfg.model.device.into(),
+                prediction,
+                execution,
+            )
         }
         PolicyKind::Smolvla => {
             ensure!(
                 artifact.policy_kind == PolicyKind::Smolvla,
                 "artifact policy differs from deployment"
             );
-            let model = policy::smolvla::SmolVlaPolicy::load_model(
-                &artifact.model_dir,
-                artifact.vlm_path.as_deref(),
-                cfg.model.device,
-            )?;
+            let model = policy::smolvla::SmolVlaPolicyConfig::new()
+                .path(&artifact.model_dir)
+                .maybe_vlm_path(artifact.vlm_path.clone())
+                .build()
+                .load_model(&cfg.model.device.into())?;
             let (prediction, execution) = model.horizon();
             let device = model.device();
             (Box::new(model), device, prediction, execution)
@@ -148,8 +155,12 @@ fn load_checkpoint(cfg: &ServerConfig) -> Result<Loaded> {
                 artifact.policy_kind == PolicyKind::Pi05,
                 "artifact policy differs from deployment"
             );
-            let model =
-                policy::pi05::Pi05Policy::load_model(&artifact.model_dir, cfg.model.device)?;
+            let model = policy::pi05::Pi05PolicyConfig::new()
+                .path(&artifact.model_dir)
+                .maybe_vlm_path(artifact.vlm_path.clone())
+                .device(cfg.model.device)
+                .build()
+                .load_model()?;
             let (prediction, execution) = model.horizon();
             let device = model.device();
             (Box::new(model), device, prediction, execution)
@@ -159,8 +170,11 @@ fn load_checkpoint(cfg: &ServerConfig) -> Result<Loaded> {
                 artifact.policy_kind == PolicyKind::Cosmos3Edge,
                 "artifact policy differs from deployment"
             );
-            let model =
-                policy::cosmos3::Cosmos3Policy::load_model(&artifact.model_dir, cfg.model.device)?;
+            let model = policy::cosmos3::Cosmos3PolicyConfig::new()
+                .path(&artifact.model_dir)
+                .device(cfg.model.device)
+                .build()
+                .load_model()?;
             let action_dim = cfg.action_feature.shape.first().copied().unwrap_or(0) as usize;
             let model = model.with_action_dim(action_dim);
             let (prediction, execution) = model.horizon();
@@ -170,7 +184,7 @@ fn load_checkpoint(cfg: &ServerConfig) -> Result<Loaded> {
         PolicyKind::Zero => anyhow::bail!("zero does not load a model artifact"),
     };
     Ok((
-        model,
+        policy,
         artifact.preprocessor,
         artifact.postprocessor,
         device,

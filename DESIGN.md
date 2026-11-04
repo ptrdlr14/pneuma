@@ -66,7 +66,9 @@ LeRobot checkpoint 由导入适配器翻译为同一组步骤与资源绑定，�
 
 ## 会话调度
 
-`server.rs` 的 pump 独占会话状态、准入、控制回复和推理结果发布。同步 `PolicyRunner::predict` 在至多一个 blocking worker 中执行；reset/close/reopen 可以推进，但旧 worker 实际退出前仍占推理名额，不把 abort 当作同步推理取消。completion 回到 pump 后比对当前 session/generation，失效的成功和错误结果均丢弃。
+`server.rs` 的 pump 独占会话状态、准入、控制回复和推理结果发布。同步 `PolicyRunner::predict` 在至多一个 blocking worker 中执行；reset 可以推进，close 标记 `closing`，两者都不把 abort 当作同步推理取消。旧 worker 实际退出前仍占推理名额，所有权也保持不变：在途推理期间的 close 等 worker 退出后才回 ACK 并释放，未完成推理不被新会话接管。completion 回到 pump 后比对当前 session/generation，失效的成功和错误结果均丢弃。
+
+会话在场由客户端在 `<session>/alive` 声明的 liveliness 令牌表示；服务端在 OPEN 时以 history 订阅该 key。令牌缺失先进入宽限（`execution.idle_timeout_s`），到期后按 `client_absence` 或 `initial_presence_timeout` 标记清理；宽限内恢复在场会取消清理。描述符暴露 `client_present`、`absence_grace_remaining_s`、`cleanup_pending`、`cleanup_reason`、`admission_blocker` 与 `session_status`。
 
 回调入口使用容量 32 的有界通道和非阻塞发送。observation 在复制 payload 前取得全实例唯一名额，该名额跨排队、推理和 completion 处理存活，不另设等待观测队列。忙时最多保留一个额外 payload 用于发布关联的 Busy；此回复名额或入口已满时直接丢弃超量消息，不生成额外任务/overflow 事件。language 同样只有一个待处理 payload 名额；入口已满的 query 由客户端超时处理。控制不会等待 predict，有限的入口积压不会保留无限图像。
 
@@ -79,12 +81,13 @@ ACTION 的 `server_durations.queue` 从回调接收时刻计到 worker 内 predi
 3. **后端**：`model.device=auto|flex|metal` 选择设备；`auto` 使用 `Device::default()`（启用后端 GPU 优先于 CPU，遵循 Burn 的 `BURN_DEVICE` 默认设备机制），显式 `flex`/`metal` 调用对应构造器。编译期同时启 `flex`（纯 Rust CPU，数值可复现）与 `metal`（Apple GPU）。部署构建完成后按 `execution.warmup_calls` 通过完整 runner 做零观测预热：metal 首推理的内核 JIT（秒级）挪进启动期，兼作权重/算子的加载自检。dtype 固定 f32。
 4. **权重**：convert 使用 `SafetensorsStore + PyTorchToBurnAdapter` 导入、`BurnToPyTorchAdapter` 导出并执行模型键名双向映射；内部保存与 serve 加载使用 Burn `ModuleRecord` 的 bpk，保留参数身份。键对不上时按键对照修正，不做名称猜测。
 5. **推理形态**：首版只做 plain chunk——观测进、`[chunk_size, action_dim]` 出，配合客户端 `chunk_merge=append`。temporal ensembling、RTC/blending、aligned merge 不在首版，入口处显式拒绝（与骨架既有原则一致）。
+6. **构造约定**：面向部署的 `*PolicyConfig` 用 bon 生成具名 builder，`build()` 只收集选项，`init()` 只构建结构，权重由 `load_record` 恢复。ACT、π₀.₅、Cosmos3 的配置同时保存 `crate::config::Device`；SmolVLA 由调用方在 `init`、`load_model`、`import_*` 传入已解析的 Burn `Device`。来自 checkpoint 的配置结构保持 serde 反序列化，内部模型组件沿用 Burn `XxxConfig::init(device)`。裸 `new` 只保留给不持有张量的普通数据结构。
 
 ## 合约 profile
 
 部署合约写在 TOML 文件中，字段分组沿用 LeRobot（`model`、`execution`、`zenoh`、`features`、`action_feature`）。`--config server.toml` 指定文件，CLI 只提供常见启动调整：checkpoint、设备、策略、动作频率、执行步数、预热次数及网络拓扑；schema、semantics 和完整部署信息只在 TOML 中维护。so101 / aloha_sim 是 `examples/` 下的部署示例，不在源码中维护另一套 profile。
 
-`cli.rs` 用 clap 子命令区分 `convert` 与 `serve`，serve 以 `ModelArgs`、`ExecutionArgs`、`NetworkArgs` 组织类型化参数，采用 `--device`、`--action-fps` 等长选项；仅将显式传入的值直接赋给 `ServerConfig` 字段，不经过 TOML 序列化和点号路径解析。字符串按 argv 原样接收；`--listen`、`--connect` 可重复指定地址，`--clear-listen`、`--clear-connect` 显式清空对应列表（与同一列表的地址参数互斥）。`ServerConfig::load` 只读取和反序列化 TOML；应用 CLI 覆盖后，由 `Server::new` 校验最终配置，再加载策略。`main` 通过 clap 处理帮助、版本和参数诊断，配置模块不退出进程。旧点号 CLI 参数移除，TOML 格式保持不变。
+`cli/` 用 clap 子命令区分 `convert` 与 `serve`：`mod.rs` 只定义 `Cli`、`Command` 和共享的 `PolicyKind` 展示适配，`serve.rs` 以 `ModelArgs`、`ExecutionArgs`、`NetworkArgs` 组织类型化参数，`convert.rs` 保存转换参数与执行入口。serve 采用 `--device`、`--action-fps` 等长选项；仅将显式传入的值直接赋给 `ServerConfig` 字段，不经过 TOML 序列化和点号路径解析。字符串按 argv 原样接收；`--listen`、`--connect` 可重复指定地址，`--clear-listen`、`--clear-connect` 显式清空对应列表（与同一列表的地址参数互斥）。`ServerConfig::load` 只读取和反序列化 TOML；应用 CLI 覆盖后，由 `Server::new` 校验最终配置，再加载策略。`main` 通过 clap 处理帮助、版本和参数诊断，配置模块不退出进程。旧点号 CLI 参数移除，TOML 格式保持不变。
 
 部署配置负责通用 schema、semantics、执行和网络约束；ACT 支持的固定 state/image/action 特征由 ACT 模块的纯校验函数维护，策略构建在读取 checkpoint 和预热之前校验，并在最终通告合约上复用。checkpoint 数值不变量在构造模块前校验，归一化缓冲在预热前校验；不合法输入返回启动错误。
 

@@ -7,7 +7,7 @@ mod tests;
 mod transformer;
 mod vision;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
 use burn::module::Module;
@@ -24,47 +24,65 @@ use crate::policy::Policy;
 use crate::processor::{Batch, Data, Pipeline};
 
 use config::SmolVlaConfig;
-use transformer::{ExpertModel, KvCache, TextConfig, TextModel};
-use vision::{Connector, VisionConfig, VisionModel};
+use transformer::{
+    SmolVlmExpertCache, SmolVlmExpertConfig, SmolVlmExpertModel, SmolVlmKvCache, SmolVlmTextConfig,
+    SmolVlmTextModel,
+};
+use vision::{SmolVlmConnector, SmolVlmConnectorConfig, SmolVlmVisionConfig, SmolVlmVisionModel};
 
 #[derive(Deserialize)]
-struct VlmConfig {
-    text_config: TextConfig,
-    vision_config: VisionConfig,
+struct SmolVlmConfig {
+    text_config: SmolVlmTextConfig,
+    vision_config: SmolVlmVisionConfig,
     scale_factor: usize,
 }
 
 #[derive(Module, Debug)]
-struct VlmModel {
-    vision_model: VisionModel,
-    connector: Connector,
-    text_model: TextModel,
+struct SmolVlmModel {
+    vision_model: SmolVlmVisionModel,
+    connector: SmolVlmConnector,
+    text_model: SmolVlmTextModel,
 }
 
 #[derive(Module, Debug)]
-struct Vlm {
-    model: VlmModel,
+struct SmolVlm {
+    model: SmolVlmModel,
 }
 
 #[derive(Module, Debug)]
-struct VlmWithExpert {
-    vlm: Vlm,
-    lm_expert: ExpertModel,
+struct SmolVlmWithExpert {
+    vlm: SmolVlm,
+    lm_expert: SmolVlmExpertModel,
 }
 
 #[derive(Module, Debug)]
-struct VLAFlowMatching {
-    vlm_with_expert: VlmWithExpert,
+struct SmolVlaFlowMatching {
+    vlm_with_expert: SmolVlmWithExpert,
     state_proj: Linear,
     action_in_proj: Linear,
     action_out_proj: Linear,
     action_time_mlp_in: Linear,
     action_time_mlp_out: Linear,
+    #[module(skip)]
+    expert_dim: usize,
 }
 
-impl VLAFlowMatching {
-    fn init(cfg: &SmolVlaConfig, vlm: &VlmConfig, device: &Device) -> Self {
+/// 动作模型的构造配置，组合策略超参与 VLM 结构。
+struct SmolVlaFlowMatchingConfig {
+    policy: SmolVlaConfig,
+    vlm: SmolVlmConfig,
+}
+
+impl SmolVlaFlowMatchingConfig {
+    fn new(policy: SmolVlaConfig, vlm: SmolVlmConfig) -> Self {
+        Self { policy, vlm }
+    }
+
+    fn init(&self, device: &Device) -> SmolVlaFlowMatching {
+        let cfg = &self.policy;
+        let vlm = &self.vlm;
         let text = &vlm.text_config;
+        let max_sequence_length = max_sequence_length(cfg, vlm);
         let expert_dim = (text.hidden_size as f64 * cfg.expert_width_multiplier) as usize;
         let mut expert = text.clone();
         expert.hidden_size = expert_dim;
@@ -78,25 +96,41 @@ impl VLAFlowMatching {
                         && index % cfg.self_attn_every_n_layers as usize == 0)
             })
             .collect();
-        Self {
-            vlm_with_expert: VlmWithExpert {
-                vlm: Vlm {
-                    model: VlmModel {
-                        vision_model: VisionModel::init(&vlm.vision_config, device),
-                        connector: Connector::init(&vlm.vision_config, text.hidden_size, device),
-                        text_model: TextModel::init(text, device),
+        SmolVlaFlowMatching {
+            vlm_with_expert: SmolVlmWithExpert {
+                vlm: SmolVlm {
+                    model: SmolVlmModel {
+                        vision_model: vlm.vision_config.init(device),
+                        connector: SmolVlmConnectorConfig::new(
+                            &vlm.vision_config,
+                            text.hidden_size,
+                        )
+                        .init(device),
+                        text_model: text.init(max_sequence_length, device),
                     },
                 },
-                lm_expert: ExpertModel::init(&expert, cross, device),
+                lm_expert: SmolVlmExpertConfig::new(expert, cross, max_sequence_length)
+                    .init(device),
             },
             state_proj: LinearConfig::new(cfg.max_state_dim, text.hidden_size).init(device),
             action_in_proj: LinearConfig::new(cfg.max_action_dim, expert_dim).init(device),
             action_out_proj: LinearConfig::new(expert_dim, cfg.max_action_dim).init(device),
             action_time_mlp_in: LinearConfig::new(expert_dim * 2, expert_dim).init(device),
             action_time_mlp_out: LinearConfig::new(expert_dim, expert_dim).init(device),
+            expert_dim,
         }
     }
+}
 
+/// 旋转表需要覆盖前缀与动作块的最大位置。
+fn max_sequence_length(cfg: &SmolVlaConfig, vlm: &SmolVlmConfig) -> usize {
+    let board = vlm.vision_config.image_size / vlm.vision_config.patch_size;
+    let tokens_per_image = (board / vlm.vision_config.scale_factor).pow(2);
+    let actual = cfg.image_features().count() * tokens_per_image + cfg.tokenizer_max_length + 1;
+    (cfg.prefix_length.max(0) as usize).max(actual) + cfg.chunk_size
+}
+
+impl SmolVlaFlowMatching {
     fn prefix(
         &self,
         images: Vec<Tensor<4>>,
@@ -104,7 +138,7 @@ impl VLAFlowMatching {
         language_valid: &[bool],
         state: Tensor<2>,
         cfg: &SmolVlaConfig,
-    ) -> (Vec<KvCache>, Vec<bool>) {
+    ) -> (Vec<SmolVlmKvCache>, Vec<bool>) {
         let vlm = &self.vlm_with_expert.vlm.model;
         let dim = state.dims()[1];
         let device = state.device();
@@ -147,18 +181,10 @@ impl VLAFlowMatching {
         )
     }
 
-    fn velocity(
-        &self,
-        x: Tensor<3>,
-        timestep: f32,
-        cache: &[KvCache],
-        valid: &[bool],
-        cfg: &SmolVlaConfig,
-    ) -> Tensor<3> {
-        let action = self.action_in_proj.forward(x);
-        let [batch, steps, dim] = action.dims();
-        let half = dim / 2;
-        let angles: Vec<_> = (0..half)
+    /// 时间步嵌入只依赖固定步表，在去噪循环前一次算完。
+    fn time_embedding(&self, timestep: f32, cfg: &SmolVlaConfig, device: &Device) -> Tensor<3> {
+        let half = self.expert_dim / 2;
+        let angles: Vec<f64> = (0..half)
             .map(|index| {
                 let fraction = index as f64 / (half - 1) as f64;
                 let period = cfg.min_period * (cfg.max_period / cfg.min_period).powf(fraction);
@@ -170,14 +196,21 @@ impl VLAFlowMatching {
             .map(|x| x.sin() as f32)
             .chain(angles.iter().map(|x| x.cos() as f32))
             .collect();
-        let time = Tensor::<3>::from_data(TensorData::new(time, [1, 1, dim]), &action.device())
-            .expand([batch, steps, dim]);
+        Tensor::<3>::from_data(TensorData::new(time, [1, 1, self.expert_dim]), device).expand([
+            1,
+            cfg.chunk_size,
+            self.expert_dim,
+        ])
+    }
+
+    fn velocity(&self, x: Tensor<3>, time: Tensor<3>, cache: &mut SmolVlmExpertCache) -> Tensor<3> {
+        let action = self.action_in_proj.forward(x);
         let suffix = self.action_time_mlp_out.forward(silu(
             self.action_time_mlp_in
                 .forward(Tensor::cat(vec![action, time], 2)),
         ));
         self.action_out_proj
-            .forward(self.vlm_with_expert.lm_expert.forward(suffix, cache, valid))
+            .forward(self.vlm_with_expert.lm_expert.forward(suffix, cache))
     }
 
     fn sample(
@@ -189,12 +222,19 @@ impl VLAFlowMatching {
         noise: Tensor<3>,
         cfg: &SmolVlaConfig,
     ) -> Tensor<3> {
-        let (cache, valid) = self.prefix(images, tokens, valid, state, cfg);
-        let mut x = noise;
+        let (prefix, valid) = self.prefix(images, tokens, valid, state, cfg);
+        let device = noise.device();
+        let mut cache = self
+            .vlm_with_expert
+            .lm_expert
+            .cache(&prefix, &valid, cfg.chunk_size);
         let dt = -1.0 / cfg.num_steps as f64;
-        for step in 0..cfg.num_steps {
-            let time = (1.0 + step as f64 * dt) as f32;
-            let velocity = self.velocity(x.clone(), time, &cache, &valid, cfg);
+        let times: Vec<Tensor<3>> = (0..cfg.num_steps)
+            .map(|step| self.time_embedding((1.0 + step as f64 * dt) as f32, cfg, &device))
+            .collect();
+        let mut x = noise;
+        for time in times {
+            let velocity = self.velocity(x.clone(), time, &mut cache);
             x = x + velocity * dt;
         }
         x
@@ -202,56 +242,32 @@ impl VLAFlowMatching {
 }
 
 pub struct SmolVlaPolicy {
-    model: VLAFlowMatching,
+    model: SmolVlaFlowMatching,
     cfg: SmolVlaConfig,
     device: Device,
 }
 
-impl SmolVlaPolicy {
-    pub fn import_configured(
-        path: &Path,
-        vlm_path: Option<&Path>,
-        backend: crate::config::Device,
-        features: &[FeatureSpec],
-        action: &FeatureSpec,
-    ) -> Result<(Self, Pipeline, Pipeline, Vec<String>)> {
-        let cfg = config::parse(&path.join("config.json"))?;
-        processing::validate_contract(&cfg, features, action)?;
-        let tokenizer_dir = vlm_path
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| path.join("vlm"));
-        let (preprocessor, postprocessor) =
-            processing::import_pipelines(path, &cfg, &tokenizer_dir)?;
-        let (policy, unused) = Self::import_lerobot(path, vlm_path, backend)?;
-        Ok((policy, preprocessor, postprocessor, unused))
-    }
+/// SmolVLA 策略的构造配置。
+///
+/// 用 bon 生成具名 builder；`init` 只构建模型结构，
+/// 权重由 `SmolVlaPolicy::load_record` 单独恢复。
+#[derive(Debug, bon::Builder)]
+#[builder(start_fn = new)]
+pub struct SmolVlaPolicyConfig {
+    #[builder(into)]
+    path: PathBuf,
+    vlm_path: Option<PathBuf>,
+}
 
-    /// 严格加载原生模型 record，外部 safetensors 必须先转换。
-    pub fn load_model(
-        path: &Path,
-        vlm_path: Option<&Path>,
-        backend: crate::config::Device,
-    ) -> Result<Self> {
-        let mut policy = Self::init_model(path, vlm_path, backend)?;
-        let record = burn::store::ModuleRecord::load(path.join("model.bpk"))
-            .context("reading native SmolVLA model.bpk; convert the LeRobot checkpoint first")?;
-        policy.model = policy
-            .model
-            .try_load_record(record)
-            .context("restoring SmolVLA model record")?;
-        Ok(policy)
-    }
-
-    fn init_model(
-        path: &Path,
-        vlm_path: Option<&Path>,
-        backend: crate::config::Device,
-    ) -> Result<Self> {
-        let cfg = config::parse(&path.join("config.json"))?;
-        let vlm_path = vlm_path
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| path.join("vlm"));
-        let mut vlm: VlmConfig =
+impl SmolVlaPolicyConfig {
+    /// 解析 checkpoint 配置与 VLM 结构，构建未加载权重的策略。
+    pub fn init(&self, device: &Device) -> Result<SmolVlaPolicy> {
+        let cfg = config::parse(&self.path.join("config.json"))?;
+        let vlm_path = self
+            .vlm_path
+            .clone()
+            .unwrap_or_else(|| self.path.join("vlm"));
+        let mut vlm: SmolVlmConfig =
             serde_json::from_slice(&std::fs::read(vlm_path.join("config.json")).context(
                 "reading local SmolVLM config; provide convert --vlm-path when importing",
             )?)?;
@@ -310,19 +326,44 @@ impl SmolVlaPolicy {
             !cfg.add_image_special_tokens,
             "SmolVLA add_image_special_tokens=true is not supported"
         );
-        let device = backend.into();
-        let model = VLAFlowMatching::init(&cfg, &vlm, &device);
-        Ok(Self { model, cfg, device })
+        let model = SmolVlaFlowMatchingConfig::new(cfg.clone(), vlm).init(device);
+        Ok(SmolVlaPolicy {
+            model,
+            cfg,
+            device: device.clone(),
+        })
+    }
+
+    /// 严格加载原生模型 record，外部 safetensors 必须先转换。
+    pub fn load_model(&self, device: &Device) -> Result<SmolVlaPolicy> {
+        let policy = self.init(device)?;
+        let record = burn::store::ModuleRecord::load(self.path.join("model.bpk"))
+            .context("reading native SmolVLA model.bpk; convert the LeRobot checkpoint first")?;
+        policy.load_record(record)
+    }
+
+    pub fn import_configured(
+        &self,
+        features: &[FeatureSpec],
+        action: &FeatureSpec,
+        device: &Device,
+    ) -> Result<(SmolVlaPolicy, Pipeline, Pipeline, Vec<String>)> {
+        let cfg = config::parse(&self.path.join("config.json"))?;
+        processing::validate_contract(&cfg, features, action)?;
+        let tokenizer_dir = self
+            .vlm_path
+            .clone()
+            .unwrap_or_else(|| self.path.join("vlm"));
+        let (preprocessor, postprocessor) =
+            processing::import_pipelines(&self.path, &cfg, &tokenizer_dir)?;
+        let (policy, unused) = self.import_lerobot(device)?;
+        Ok((policy, preprocessor, postprocessor, unused))
     }
 
     /// 转换边界导入 LeRobot 参数；未使用参数留给 checkpoint 转换器保存。
-    pub fn import_lerobot(
-        path: &Path,
-        vlm_path: Option<&Path>,
-        backend: crate::config::Device,
-    ) -> Result<(Self, Vec<String>)> {
-        let mut policy = Self::init_model(path, vlm_path, backend)?;
-        let mut store = SafetensorsStore::from_file(path.join("model.safetensors"))
+    pub fn import_lerobot(&self, device: &Device) -> Result<(SmolVlaPolicy, Vec<String>)> {
+        let mut policy = self.init(device)?;
+        let mut store = SafetensorsStore::from_file(self.path.join("model.safetensors"))
             .with_from_adapter(PyTorchToBurnAdapter.chain(FloatCastAdapter::to(DType::F32)))
             .with_key_remapping(r"^model\.", "")
             .allow_partial(true);
@@ -343,6 +384,21 @@ impl SmolVlaPolicy {
             "SmolVLA weights imported"
         );
         Ok((policy, applied.unused))
+    }
+}
+
+impl SmolVlaPolicy {
+    /// 应用已加载的原生 record；结构由 `SmolVlaPolicyConfig::init` 构建。
+    pub fn load_record(self, record: burn::store::ModuleRecord) -> Result<Self> {
+        let model = self
+            .model
+            .try_load_record(record)
+            .context("restoring SmolVLA model record")?;
+        Ok(Self {
+            model,
+            cfg: self.cfg,
+            device: self.device,
+        })
     }
 
     /// 保存当前模型参数与参数身份，pipeline 由 checkpoint 独立保存。

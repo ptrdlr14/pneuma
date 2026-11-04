@@ -18,7 +18,7 @@ mod text;
 mod vae;
 mod vision;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
 use burn::module::Module;
@@ -45,18 +45,25 @@ pub struct Cosmos3Policy {
     action_dim: usize,
 }
 
-impl Cosmos3Policy {
-    /// 从原生 bpk 目录加载。
-    pub fn load_model(path: &Path, backend: app::Device) -> Result<Self> {
-        let cfg = config::parse(&path.join("config.json"))?;
-        let device = backend.into();
+/// Cosmos3 Edge 策略的构造配置。
+///
+/// 用 bon 生成具名 builder；`init` 只构建模型结构，
+/// 权重由 `Cosmos3Policy::load_record` 单独恢复。
+#[derive(Debug, bon::Builder)]
+#[builder(start_fn = new)]
+pub struct Cosmos3PolicyConfig {
+    #[builder(into)]
+    path: PathBuf,
+    device: app::Device,
+}
+
+impl Cosmos3PolicyConfig {
+    /// 解析 `config.json` 并构建未加载权重的策略。
+    pub fn init(&self) -> Result<Cosmos3Policy> {
+        let cfg = config::parse(&self.path.join("config.json"))?;
+        let device: Device = self.device.into();
         let runtime = Cosmos3Runtime::init(&cfg, &device);
-        let record = burn::store::ModuleRecord::load(path.join("model.bpk"))
-            .context("reading native cosmos3 model.bpk; convert the LeRobot checkpoint first")?;
-        let runtime = runtime
-            .try_load_record(record)
-            .context("restoring cosmos3 model record")?;
-        Ok(Self {
+        Ok(Cosmos3Policy {
             runtime,
             cfg,
             device,
@@ -64,27 +71,34 @@ impl Cosmos3Policy {
         })
     }
 
+    /// 从原生 bpk 目录加载。
+    pub fn load_model(&self) -> Result<Cosmos3Policy> {
+        let policy = self.init()?;
+        let record = burn::store::ModuleRecord::load(self.path.join("model.bpk"))
+            .context("reading native cosmos3 model.bpk; convert the LeRobot checkpoint first")?;
+        policy.load_record(record)
+    }
+
     /// 从 LeRobot checkpoint 导入权重并构建两条管线。
     pub fn import_configured(
-        path: &Path,
-        backend: app::Device,
+        &self,
         features: &[crate::contract::FeatureSpec],
         action: &crate::contract::FeatureSpec,
     ) -> Result<(
-        Self,
+        Cosmos3Policy,
         crate::processor::Pipeline,
         crate::processor::Pipeline,
         Vec<String>,
     )> {
-        let cfg = config::parse(&path.join("config.json"))?;
+        let cfg = config::parse(&self.path.join("config.json"))?;
         processing::validate_contract(&cfg, features, action)?;
-        let tokenizer_dir = path.join("tokenizer");
+        let tokenizer_dir = self.path.join("tokenizer");
         let (pre, post) = processing::import_pipelines(&cfg, &tokenizer_dir, features, action)?;
-        let device = backend.into();
-        let (runtime, unused) = Cosmos3Runtime::import_lerobot(path, &cfg, &device)?;
+        let device: Device = self.device.into();
+        let (runtime, unused) = Cosmos3Runtime::import_lerobot(&self.path, &cfg, &device)?;
         let action_dim = action.shape[0] as usize;
         Ok((
-            Self {
+            Cosmos3Policy {
                 runtime,
                 cfg,
                 device,
@@ -94,6 +108,22 @@ impl Cosmos3Policy {
             post,
             unused,
         ))
+    }
+}
+
+impl Cosmos3Policy {
+    /// 应用已加载的原生 record；结构由 `Cosmos3PolicyConfig::init` 构建。
+    pub fn load_record(self, record: burn::store::ModuleRecord) -> Result<Self> {
+        let runtime = self
+            .runtime
+            .try_load_record(record)
+            .context("restoring cosmos3 model record")?;
+        Ok(Self {
+            runtime,
+            cfg: self.cfg,
+            device: self.device,
+            action_dim: self.action_dim,
+        })
     }
 
     /// 以 LeRobot 布局导出权重，供转换时核对张量清单。
@@ -378,7 +408,11 @@ mod native {
         let directory = std::path::PathBuf::from(
             std::env::var("PNEUMA_COSMOS3_NATIVE").expect("PNEUMA_COSMOS3_NATIVE"),
         );
-        let policy = Cosmos3Policy::load_model(&directory.join("model"), app::Device::Flex)
+        let policy = Cosmos3PolicyConfig::new()
+            .path(directory.join("model"))
+            .device(app::Device::Flex)
+            .build()
+            .load_model()
             .expect("loading native artifact")
             .with_action_dim(7);
         let device = policy.device();
@@ -439,7 +473,11 @@ mod parity {
         let parity = std::path::PathBuf::from(
             std::env::var("PNEUMA_COSMOS3_GENERATE").expect("PNEUMA_COSMOS3_GENERATE"),
         );
-        let policy = Cosmos3Policy::load_model(&directory.join("model"), app::Device::Flex)
+        let policy = Cosmos3PolicyConfig::new()
+            .path(directory.join("model"))
+            .device(app::Device::Flex)
+            .build()
+            .load_model()
             .expect("loading native artifact")
             .with_action_dim(7);
         let device = policy.device();
@@ -618,7 +656,11 @@ mod parity {
         let parity = std::path::PathBuf::from(
             std::env::var("PNEUMA_COSMOS3_GENERATE").expect("PNEUMA_COSMOS3_GENERATE"),
         );
-        let policy = Cosmos3Policy::load_model(&directory.join("model"), app::Device::Flex)
+        let policy = Cosmos3PolicyConfig::new()
+            .path(directory.join("model"))
+            .device(app::Device::Flex)
+            .build()
+            .load_model()
             .expect("loading native artifact")
             .with_action_dim(7);
         let device = policy.device();
@@ -714,7 +756,11 @@ mod steps {
         let parity = std::path::PathBuf::from(
             std::env::var("PNEUMA_COSMOS3_GENERATE").expect("PNEUMA_COSMOS3_GENERATE"),
         );
-        let policy = Cosmos3Policy::load_model(&directory.join("model"), app::Device::Flex)
+        let policy = Cosmos3PolicyConfig::new()
+            .path(directory.join("model"))
+            .device(app::Device::Flex)
+            .build()
+            .load_model()
             .expect("loading native artifact")
             .with_action_dim(7);
         let device = policy.device();

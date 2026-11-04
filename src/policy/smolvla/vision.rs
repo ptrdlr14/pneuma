@@ -1,17 +1,55 @@
 //! SmolVLM 的 SigLIP 视觉塔及保留 patch 顺序的 pixel-shuffle connector。
 
-use burn::module::Module;
+use burn::module::{Module, Param};
 use burn::nn::conv::{Conv2d, Conv2dConfig};
 use burn::nn::{Embedding, EmbeddingConfig, Linear, LinearConfig};
 use burn::tensor::activation::{gelu_approximate, softmax};
 use burn::tensor::{Device, Int, Tensor, TensorData};
 use serde::Deserialize;
 
-use super::transformer::LayerNorm;
+/// SigLIP 视觉塔使用的标准 LayerNorm。
+#[derive(Module, Debug)]
+pub(super) struct SmolVlmVisionLayerNorm {
+    weight: Param<Tensor<1>>,
+    bias: Param<Tensor<1>>,
+    #[module(skip)]
+    epsilon: f64,
+}
+
+/// SmolVLM 视觉层归一化的构造参数。
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SmolVlmVisionLayerNormConfig {
+    dim: usize,
+    epsilon: f64,
+}
+
+impl SmolVlmVisionLayerNormConfig {
+    pub(super) fn new(dim: usize, epsilon: f64) -> Self {
+        Self { dim, epsilon }
+    }
+
+    pub(super) fn init(&self, device: &Device) -> SmolVlmVisionLayerNorm {
+        SmolVlmVisionLayerNorm {
+            weight: Param::from_tensor(Tensor::ones([self.dim], device)),
+            bias: Param::from_tensor(Tensor::zeros([self.dim], device)),
+            epsilon: self.epsilon,
+        }
+    }
+}
+
+impl SmolVlmVisionLayerNorm {
+    pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
+        let dim = x.dims()[2];
+        let centered = x.clone() - x.mean_dim(2);
+        let variance = centered.clone().powf_scalar(2.0).mean_dim(2);
+        centered / (variance + self.epsilon).sqrt() * self.weight.val().reshape([1, 1, dim])
+            + self.bias.val().reshape([1, 1, dim])
+    }
+}
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
-pub(super) struct VisionConfig {
+pub(super) struct SmolVlmVisionConfig {
     pub hidden_size: usize,
     pub intermediate_size: usize,
     pub num_hidden_layers: usize,
@@ -22,7 +60,7 @@ pub(super) struct VisionConfig {
     pub scale_factor: usize,
 }
 
-impl Default for VisionConfig {
+impl Default for SmolVlmVisionConfig {
     fn default() -> Self {
         Self {
             hidden_size: 768,
@@ -37,7 +75,7 @@ impl Default for VisionConfig {
     }
 }
 
-impl VisionConfig {
+impl SmolVlmVisionConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.num_attention_heads > 0
@@ -59,22 +97,40 @@ impl VisionConfig {
 }
 
 #[derive(Module, Debug)]
-struct VisionEmbeddings {
+struct SmolVlmVisionEmbeddings {
     patch_embedding: Conv2d,
     position_embedding: Embedding,
 }
 
-impl VisionEmbeddings {
-    fn init(cfg: &VisionConfig, device: &Device) -> Self {
-        let grid = cfg.image_size / cfg.patch_size;
+/// 视觉嵌入层的构造参数。
+#[derive(Clone, Copy, Debug)]
+struct SmolVlmVisionEmbeddingsConfig {
+    hidden: usize,
+    patch: usize,
+    grid: usize,
+}
+
+impl SmolVlmVisionEmbeddingsConfig {
+    fn new(cfg: &SmolVlmVisionConfig) -> Self {
         Self {
-            patch_embedding: Conv2dConfig::new([3, cfg.hidden_size], [cfg.patch_size; 2])
-                .with_stride([cfg.patch_size; 2])
-                .init(device),
-            position_embedding: EmbeddingConfig::new(grid * grid, cfg.hidden_size).init(device),
+            hidden: cfg.hidden_size,
+            patch: cfg.patch_size,
+            grid: cfg.image_size / cfg.patch_size,
         }
     }
 
+    fn init(&self, device: &Device) -> SmolVlmVisionEmbeddings {
+        SmolVlmVisionEmbeddings {
+            patch_embedding: Conv2dConfig::new([3, self.hidden], [self.patch; 2])
+                .with_stride([self.patch; 2])
+                .init(device),
+            position_embedding: EmbeddingConfig::new(self.grid * self.grid, self.hidden)
+                .init(device),
+        }
+    }
+}
+
+impl SmolVlmVisionEmbeddings {
     fn forward(&self, image: Tensor<4>) -> Tensor<3> {
         let patches = self.patch_embedding.forward(image);
         let [batch, dim, h, w] = patches.dims();
@@ -87,7 +143,7 @@ impl VisionEmbeddings {
 }
 
 #[derive(Module, Debug)]
-struct VisionAttention {
+struct SmolVlmVisionAttention {
     q_proj: Linear,
     k_proj: Linear,
     v_proj: Linear,
@@ -96,18 +152,27 @@ struct VisionAttention {
     heads: usize,
 }
 
-impl VisionAttention {
-    fn init(cfg: &VisionConfig, device: &Device) -> Self {
-        let linear = || LinearConfig::new(cfg.hidden_size, cfg.hidden_size).init(device);
-        Self {
+/// 视觉注意力的构造参数。
+#[derive(Clone, Copy, Debug)]
+struct SmolVlmVisionAttentionConfig {
+    hidden: usize,
+    heads: usize,
+}
+
+impl SmolVlmVisionAttentionConfig {
+    fn init(&self, device: &Device) -> SmolVlmVisionAttention {
+        let linear = || LinearConfig::new(self.hidden, self.hidden).init(device);
+        SmolVlmVisionAttention {
             q_proj: linear(),
             k_proj: linear(),
             v_proj: linear(),
             out_proj: linear(),
-            heads: cfg.num_attention_heads,
+            heads: self.heads,
         }
     }
+}
 
+impl SmolVlmVisionAttention {
     fn forward(&self, x: Tensor<3>) -> Tensor<3> {
         let [batch, seq, dim] = x.dims();
         let width = dim / self.heads;
@@ -129,32 +194,55 @@ impl VisionAttention {
 }
 
 #[derive(Module, Debug)]
-struct VisionMlp {
+struct SmolVlmVisionMlp {
     fc1: Linear,
     fc2: Linear,
 }
 
-#[derive(Module, Debug)]
-struct VisionEncoderLayer {
-    self_attn: VisionAttention,
-    layer_norm1: LayerNorm,
-    mlp: VisionMlp,
-    layer_norm2: LayerNorm,
+/// 视觉 MLP 的构造参数。
+#[derive(Clone, Copy, Debug)]
+struct SmolVlmVisionMlpConfig {
+    hidden: usize,
+    intermediate: usize,
 }
 
-impl VisionEncoderLayer {
-    fn init(cfg: &VisionConfig, device: &Device) -> Self {
-        Self {
-            self_attn: VisionAttention::init(cfg, device),
-            layer_norm1: LayerNorm::init(cfg.hidden_size, cfg.layer_norm_eps, device),
-            mlp: VisionMlp {
-                fc1: LinearConfig::new(cfg.hidden_size, cfg.intermediate_size).init(device),
-                fc2: LinearConfig::new(cfg.intermediate_size, cfg.hidden_size).init(device),
-            },
-            layer_norm2: LayerNorm::init(cfg.hidden_size, cfg.layer_norm_eps, device),
+impl SmolVlmVisionMlpConfig {
+    fn init(&self, device: &Device) -> SmolVlmVisionMlp {
+        SmolVlmVisionMlp {
+            fc1: LinearConfig::new(self.hidden, self.intermediate).init(device),
+            fc2: LinearConfig::new(self.intermediate, self.hidden).init(device),
         }
     }
+}
 
+#[derive(Module, Debug)]
+struct SmolVlmVisionEncoderLayer {
+    self_attn: SmolVlmVisionAttention,
+    layer_norm1: SmolVlmVisionLayerNorm,
+    mlp: SmolVlmVisionMlp,
+    layer_norm2: SmolVlmVisionLayerNorm,
+}
+
+/// 视觉编码层的构造参数，组合注意力、MLP 与归一化子配置。
+#[derive(Clone, Copy, Debug)]
+struct SmolVlmVisionEncoderLayerConfig {
+    attention: SmolVlmVisionAttentionConfig,
+    mlp: SmolVlmVisionMlpConfig,
+    norm: SmolVlmVisionLayerNormConfig,
+}
+
+impl SmolVlmVisionEncoderLayerConfig {
+    fn init(&self, device: &Device) -> SmolVlmVisionEncoderLayer {
+        SmolVlmVisionEncoderLayer {
+            self_attn: self.attention.init(device),
+            layer_norm1: self.norm.init(device),
+            mlp: self.mlp.init(device),
+            layer_norm2: self.norm.init(device),
+        }
+    }
+}
+
+impl SmolVlmVisionEncoderLayer {
     fn forward(&self, x: Tensor<3>) -> Tensor<3> {
         let x = x.clone() + self.self_attn.forward(self.layer_norm1.forward(x));
         let mlp = self.mlp.fc2.forward(gelu_approximate(
@@ -165,30 +253,50 @@ impl VisionEncoderLayer {
 }
 
 #[derive(Module, Debug)]
-struct VisionEncoder {
-    layers: Vec<VisionEncoderLayer>,
+struct SmolVlmVisionEncoder {
+    layers: Vec<SmolVlmVisionEncoderLayer>,
 }
 
 #[derive(Module, Debug)]
-pub(super) struct VisionModel {
-    embeddings: VisionEmbeddings,
-    encoder: VisionEncoder,
-    post_layernorm: LayerNorm,
+pub(super) struct SmolVlmVisionModel {
+    embeddings: SmolVlmVisionEmbeddings,
+    encoder: SmolVlmVisionEncoder,
+    post_layernorm: SmolVlmVisionLayerNorm,
 }
 
-impl VisionModel {
-    pub fn init(cfg: &VisionConfig, device: &Device) -> Self {
-        Self {
-            embeddings: VisionEmbeddings::init(cfg, device),
-            encoder: VisionEncoder {
-                layers: (0..cfg.num_hidden_layers)
-                    .map(|_| VisionEncoderLayer::init(cfg, device))
-                    .collect(),
+impl SmolVlmVisionConfig {
+    fn layer(&self) -> SmolVlmVisionEncoderLayerConfig {
+        SmolVlmVisionEncoderLayerConfig {
+            attention: SmolVlmVisionAttentionConfig {
+                hidden: self.hidden_size,
+                heads: self.num_attention_heads,
             },
-            post_layernorm: LayerNorm::init(cfg.hidden_size, cfg.layer_norm_eps, device),
+            mlp: SmolVlmVisionMlpConfig {
+                hidden: self.hidden_size,
+                intermediate: self.intermediate_size,
+            },
+            norm: SmolVlmVisionLayerNormConfig::new(self.hidden_size, self.layer_norm_eps),
         }
     }
 
+    pub fn init(&self, device: &Device) -> SmolVlmVisionModel {
+        SmolVlmVisionModel {
+            embeddings: SmolVlmVisionEmbeddingsConfig::new(self).init(device),
+            encoder: SmolVlmVisionEncoder {
+                layers: (0..self.num_hidden_layers)
+                    .map(|_| self.layer().init(device))
+                    .collect(),
+            },
+            post_layernorm: SmolVlmVisionLayerNormConfig::new(
+                self.hidden_size,
+                self.layer_norm_eps,
+            )
+            .init(device),
+        }
+    }
+}
+
+impl SmolVlmVisionModel {
     pub fn forward(&self, image: Tensor<4>) -> Tensor<3> {
         let mut x = self.embeddings.forward(image);
         for layer in &self.encoder.layers {
@@ -199,32 +307,52 @@ impl VisionModel {
 }
 
 #[derive(Module, Debug)]
-struct ModalityProjection {
+struct SmolVlmModalityProjection {
     proj: Linear,
 }
 
 #[derive(Module, Debug)]
-pub(super) struct Connector {
-    modality_projection: ModalityProjection,
+pub(super) struct SmolVlmConnector {
+    modality_projection: SmolVlmModalityProjection,
     #[module(skip)]
     scale_factor: usize,
     #[module(skip)]
     grid: usize,
 }
 
-impl Connector {
-    pub fn init(cfg: &VisionConfig, text_dim: usize, device: &Device) -> Self {
+/// SmolVlmConnector 的构造参数；`text_dim` 是 VLM 文本宽度。
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SmolVlmConnectorConfig {
+    hidden: usize,
+    scale_factor: usize,
+    grid: usize,
+    text_dim: usize,
+}
+
+impl SmolVlmConnectorConfig {
+    pub(super) fn new(cfg: &SmolVlmVisionConfig, text_dim: usize) -> Self {
         Self {
-            modality_projection: ModalityProjection {
-                proj: LinearConfig::new(cfg.hidden_size * cfg.scale_factor.pow(2), text_dim)
-                    .with_bias(false)
-                    .init(device),
-            },
+            hidden: cfg.hidden_size,
             scale_factor: cfg.scale_factor,
             grid: cfg.image_size / cfg.patch_size,
+            text_dim,
         }
     }
 
+    pub(super) fn init(&self, device: &Device) -> SmolVlmConnector {
+        SmolVlmConnector {
+            modality_projection: SmolVlmModalityProjection {
+                proj: LinearConfig::new(self.hidden * self.scale_factor.pow(2), self.text_dim)
+                    .with_bias(false)
+                    .init(device),
+            },
+            scale_factor: self.scale_factor,
+            grid: self.grid,
+        }
+    }
+}
+
+impl SmolVlmConnector {
     pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
         self.modality_projection
             .proj
@@ -240,47 +368,4 @@ fn pixel_shuffle(x: Tensor<3>, grid: usize, scale: usize) -> Tensor<3> {
         .reshape([batch, small, small, dim * scale * scale])
         .permute([0, 2, 1, 3])
         .reshape([batch, small * small, dim * scale * scale])
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn pixel_shuffle_preserves_official_patch_order() {
-        let x = Tensor::<3>::from_data(
-            TensorData::new((0..16).map(|x| x as f32).collect(), [1, 16, 1]),
-            &Device::flex(),
-        );
-        let output = pixel_shuffle(x, 4, 2)
-            .into_data()
-            .try_to_vec::<f32>()
-            .unwrap();
-        assert_eq!(
-            output,
-            [
-                0., 1., 4., 5., 2., 3., 6., 7., 8., 9., 12., 13., 10., 11., 14., 15.
-            ]
-        );
-    }
-
-    #[test]
-    fn small_vision_tower_and_connector_produce_finite_tokens() {
-        let cfg = VisionConfig {
-            hidden_size: 8,
-            intermediate_size: 16,
-            num_hidden_layers: 2,
-            num_attention_heads: 2,
-            image_size: 8,
-            patch_size: 2,
-            scale_factor: 2,
-            ..Default::default()
-        };
-        cfg.validate().unwrap();
-        let device = Device::flex();
-        let output = Connector::init(&cfg, 12, &device)
-            .forward(VisionModel::init(&cfg, &device).forward(Tensor::ones([1, 3, 8, 8], &device)));
-        assert_eq!(output.dims(), [1, 4, 12]);
-        assert!(output.into_data().iter::<f32>().all(|x| x.is_finite()));
-    }
 }

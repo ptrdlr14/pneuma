@@ -1,5 +1,4 @@
 //! torchvision resnet18 的移植（FrozenBatchNorm2d 即 eval BN）：conv1/bn1/maxpool/layer1..4。
-//! 字段名与 torch `state_dict` 段一一对应；downsample.0/.1 → conv/norm 两个键在加载处重映射。
 
 use burn::module::Module;
 use burn::nn::PaddingConfig2d;
@@ -9,44 +8,16 @@ use burn::nn::pool::{MaxPool2d, MaxPool2dConfig};
 use burn::tensor::activation::relu;
 use burn::tensor::{Device, Tensor};
 
-#[derive(Clone, Copy, Debug)]
-pub struct BasicBlockConfig {
-    pub channels: usize,
-    pub stride: usize,
-}
-
-impl BasicBlockConfig {
-    fn conv(from: usize, to: usize, stride: usize, device: &Device) -> Conv2d {
-        Conv2dConfig::new([from, to], [3, 3])
-            .with_stride([stride, stride])
-            .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
-            .with_bias(false)
-            .init(device)
-    }
-
-    pub fn init(&self, prev_channels: usize, device: &Device) -> BasicBlock {
-        let stride = self.stride;
-        let downsample = (stride != 1 || prev_channels != self.channels).then(|| Downsample {
-            conv: Conv2dConfig::new([prev_channels, self.channels], [1, 1])
-                .with_stride([stride, stride])
-                .with_bias(false)
-                .init(device),
-            norm: BatchNormConfig::new(self.channels).init(device),
-        });
-        BasicBlock {
-            conv1: Self::conv(prev_channels, self.channels, stride, device),
-            bn1: BatchNormConfig::new(self.channels).init(device),
-            conv2: Self::conv(self.channels, self.channels, 1, device),
-            bn2: BatchNormConfig::new(self.channels).init(device),
-            downsample,
-        }
-    }
-}
-
 #[derive(Module, Debug)]
 pub struct Downsample {
     pub conv: Conv2d,
     pub norm: BatchNorm,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BasicBlockConfig {
+    pub channels: usize,
+    pub stride: usize,
 }
 
 #[derive(Module, Debug)]
@@ -56,6 +27,33 @@ pub struct BasicBlock {
     pub conv2: Conv2d,
     pub bn2: BatchNorm,
     pub downsample: Option<Downsample>,
+}
+
+impl BasicBlockConfig {
+    pub fn init(&self, prev_channels: usize, device: &Device) -> BasicBlock {
+        let conv = |from: usize, to: usize, stride: usize| -> Conv2d {
+            Conv2dConfig::new([from, to], [3, 3])
+                .with_stride([stride, stride])
+                .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
+                .with_bias(false)
+                .init(device)
+        };
+        let stride = self.stride;
+        let downsample = (stride != 1 || prev_channels != self.channels).then(|| Downsample {
+            conv: Conv2dConfig::new([prev_channels, self.channels], [1, 1])
+                .with_stride([stride, stride])
+                .with_bias(false)
+                .init(device),
+            norm: BatchNormConfig::new(self.channels).init(device),
+        });
+        BasicBlock {
+            conv1: conv(prev_channels, self.channels, stride),
+            bn1: BatchNormConfig::new(self.channels).init(device),
+            conv2: conv(self.channels, self.channels, 1),
+            bn2: BatchNormConfig::new(self.channels).init(device),
+            downsample,
+        }
+    }
 }
 
 impl BasicBlock {
@@ -72,6 +70,8 @@ impl BasicBlock {
     }
 }
 
+pub struct ResnetConfig;
+
 /// `IntermediateLayerGetter(resnet18, {"layer4": "feature_map"})`，只到 layer4。
 #[derive(Module, Debug)]
 pub struct Resnet {
@@ -85,20 +85,17 @@ pub struct Resnet {
     pub layer4: Vec<BasicBlock>,
 }
 
-pub struct ResnetConfig;
-
 impl ResnetConfig {
-    // 首块仅在 stride≠1 或通道变化时才带 downsample（layer1 首块 64→64 s1 是恒等捷径）。
-    fn layer(channels: usize, stride: usize, prev: usize, device: &Device) -> Vec<BasicBlock> {
-        let first = BasicBlockConfig { channels, stride };
-        let second = BasicBlockConfig {
-            channels,
-            stride: 1,
-        };
-        vec![first.init(prev, device), second.init(channels, device)]
-    }
-
     pub fn init(&self, device: &Device) -> Resnet {
+        let layer = |channels: usize, stride: usize, prev: usize| -> Vec<BasicBlock> {
+            let first = BasicBlockConfig { channels, stride };
+            let second = BasicBlockConfig {
+                channels,
+                stride: 1,
+            };
+            vec![first.init(prev, device), second.init(channels, device)]
+        };
+
         Resnet {
             conv1: Conv2dConfig::new([3, 64], [7, 7])
                 .with_stride([2, 2])
@@ -110,10 +107,10 @@ impl ResnetConfig {
                 .with_strides([2, 2])
                 .with_padding(PaddingConfig2d::Explicit(1, 1, 1, 1))
                 .init(),
-            layer1: Self::layer(64, 1, 64, device),
-            layer2: Self::layer(128, 2, 64, device),
-            layer3: Self::layer(256, 2, 128, device),
-            layer4: Self::layer(512, 2, 256, device),
+            layer1: layer(64, 1, 64),
+            layer2: layer(128, 2, 64),
+            layer3: layer(256, 2, 128),
+            layer4: layer(512, 2, 256),
         }
     }
 }

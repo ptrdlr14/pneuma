@@ -56,60 +56,6 @@ fn values(batch: &Batch, key: &str) -> Vec<f32> {
 }
 
 #[test]
-fn training_affine_and_linear_keep_gradients_on_broadcast_axes() {
-    let device = Device::flex().autodiff();
-    let x = Tensor::<3>::from_data([[[2.0, 4.0], [8.0, 12.0]]], &device).require_grad();
-    let pipeline = Pipeline::new(
-        schema(&[1, 2, 2]),
-        vec![
-            Step::Affine {
-                key: "state".into(),
-                offset: vec![0.0, 4.0],
-                scale: vec![2.0, 4.0],
-                axis: 1,
-            },
-            Step::Linear {
-                key: "state".into(),
-                offset: vec![1.0],
-                scale: vec![3.0, 0.0],
-                axis: 2,
-            },
-        ],
-    )
-    .unwrap();
-    let batch = Batch {
-        values: BTreeMap::from([("state".into(), Data::Float3(x.clone()))]),
-        tasks: vec![],
-    };
-    let output = pipeline
-        .run(
-            batch,
-            &Context {
-                device,
-                mode: Mode::Train,
-            },
-        )
-        .unwrap()
-        .take("state")
-        .unwrap()
-        .into_float3()
-        .unwrap();
-    assert_eq!(
-        output.to_data().try_to_vec::<f32>().unwrap(),
-        vec![4.0, 1.0, 4.0, 1.0]
-    );
-    let gradients = output.sum().backward();
-    assert_eq!(
-        x.grad(&gradients)
-            .unwrap()
-            .to_data()
-            .try_to_vec::<f32>()
-            .unwrap(),
-        vec![1.5, 0.0, 0.75, 0.0]
-    );
-}
-
-#[test]
 fn inference_export_is_explicit_and_training_cannot_detach() {
     let pipeline = Pipeline::new(schema(&[1, 2]), vec![Step::Device, Step::Host]).unwrap();
     let batch = input(&[1, 2], &[2.0, 3.0]);

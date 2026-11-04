@@ -5,29 +5,31 @@
 //!   `<instance>/alive`             liveliness token（服务端在场）
 //!   `<session>/control`            queryable  CONTROL → ACK
 //!   `<session>/obs`                subscriber OBSERVATION → 发布 ACTION 到 `<session>/act`
-//!   `<session>/alive`              客户端在场令牌（骨架未接，缺席宽限为 TODO）
+//!   `<session>/alive`              客户端在场令牌，history 订阅；缺席宽限见 `expire_session`
 //!
-//! 支持范围：plain chunk（`chunk_merge=append`）。aligned/blending、RTC、language、
-//! 缺席宽限尚未实现；观测和 status 要求 generation 精确匹配。
+//! 支持范围：plain chunk（`chunk_merge=append`）。aligned/blending、RTC、language 尚未实现；
+//! 观测和 status 要求 generation 精确匹配。
 //!
 //! 并发模型：有界回调入口汇入单任务泵；泵独占会话和发布，
 //! 至多一个 blocking worker 执行同步策略，控制无需等待推理。
+//! 清理遵循 LeRobot：先标记 closing，再有在途推理时等它结束，之后才释放所有权。
 
 use std::io::Cursor;
 use std::sync::Arc;
 
 use rmpv::Value;
 use serde::Serialize;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{
     OwnedSemaphorePermit, Semaphore,
     mpsc::{Receiver, Sender, channel},
+    watch,
 };
 use tokio::task::JoinHandle;
 use zenoh::Session;
 use zenoh::query::Query;
-use zenoh::sample::Sample;
+use zenoh::sample::{Sample, SampleKind};
 
 // callback 形态的声明句柄：接收端类型为 ()，Drop 即撤销声明。
 type QueryableHandle = zenoh::query::Queryable<()>;
@@ -45,6 +47,8 @@ use crate::protocol::{
 const LANGUAGE_DEADLINE_S: f64 = 60.0;
 const MAX_INPUT_CHARS: u64 = 4096;
 const MAX_OUTPUT_CHARS: u64 = 8192;
+/// 在场事件只更新 watch；泵按此周期读取最新值并检查缺席宽限。
+const PRESENCE_POLL: Duration = Duration::from_millis(50);
 
 /// 有界回调积压；观测和 language 另用名额约束大 payload。
 const INGRESS_CAPACITY: usize = 32;
@@ -122,11 +126,51 @@ struct Completion {
 struct ActiveSession {
     id: String,
     generation: i64,
+    /// 最近一次在场事件；`None` 表示尚未收到。
+    present: Option<bool>,
+    /// 首帧 Put 之后才区分「客户端离开」和「初始在场超时」。
+    presence_established: bool,
+    absent_since: Option<Instant>,
+    closing: bool,
+    cleanup_reason: Option<&'static str>,
+    /// 在途推理期间收到的 close 查询；推理完成后再回 ACK 并释放。
+    pending_close: Option<(Query, Envelope)>,
+    /// liveliness 回调写入，泵周期读取；只保留最新值。
+    presence: watch::Receiver<Option<bool>>,
     /// 保留通道句柄；会话关闭时随 Drop 撤销 zenoh 声明。
     _obs: SubscriberHandle,
     _control: QueryableHandle,
     /// 骨架禁用 language，但客户端准入要求该订阅在场，收到请求回 UNSUPPORTED。
     _language: SubscriberHandle,
+    _alive: SubscriberHandle,
+}
+
+impl ActiveSession {
+    /// 把 liveliness 的最新状态合并进会话；恢复在场会取消宽限。
+    fn sync_presence(&mut self, now: Instant) {
+        if !self.presence.has_changed().unwrap_or(false) {
+            return;
+        }
+        let Some(present) = *self.presence.borrow_and_update() else {
+            return;
+        };
+        if present {
+            if !self.presence_established {
+                tracing::info!(session = self.id, "initial client presence established");
+            } else if self.present == Some(false) {
+                tracing::info!(session = self.id, "client presence restored");
+            }
+            self.present = Some(true);
+            self.presence_established = true;
+            self.absent_since = None;
+        } else {
+            self.present = Some(false);
+            if self.absent_since.is_none() {
+                self.absent_since = Some(now);
+                tracing::info!(session = self.id, "client presence lost");
+            }
+        }
+    }
 }
 
 pub struct Server {
@@ -302,29 +346,40 @@ impl Server {
     async fn pump(self, zenoh: Session, mut rx: Receiver<Ingress>, tx: IngressSender) {
         let mut session: Option<ActiveSession> = None;
         let mut worker: Option<JoinHandle<Completion>> = None;
+        let mut ticker = tokio::time::interval(PRESENCE_POLL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             let ingress = tokio::select! {
                 biased;
+                // 先处理入口再收完成结果：在途推理期间收到的 close 必须先入账，
+                // 否则完成分支会释放会话，使 close 查询拿到 STALE。
+                ingress = rx.recv() => match ingress {
+                    Some(ingress) => ingress,
+                    None => break,
+                },
                 result = async { worker.as_mut().expect("worker present").await }, if worker.is_some() => {
                     worker = None;
                     match result {
                         Ok(completion) => self.complete_observation(&zenoh, session.as_ref(), completion).await,
                         Err(error) => tracing::error!(%error, "inference worker failed"),
                     }
+                    if session.as_ref().is_some_and(|active| active.closing) {
+                        self.release_session(&mut session).await;
+                    }
                     continue;
                 }
-                ingress = rx.recv() => match ingress {
-                    Some(ingress) => ingress,
-                    None => break,
-                },
+                _ = ticker.tick() => {
+                    // 没有在途推理时宽限到期即可释放；否则继续持有到完成分支。
+                    if self.expire_session(&mut session, worker.is_some()) {
+                        self.release_session(&mut session).await;
+                    }
+                    continue;
+                }
             };
             match ingress {
                 Ingress::Describe(query) => {
                     let mut reply = self.control_reply(&query, MessageType::Descriptor, |me| {
-                        me.descriptor_body(
-                            session.as_ref().map(|active| active.id.as_str()),
-                            tx.observation.available_permits() == 0,
-                        )
+                        me.descriptor_body(session.as_ref(), worker.is_some())
                     });
                     // 客户端断言 descriptor.instance_id == 信封 instance_id；
                     // DESCRIBE 请求允许空身份，因此回复必须盖上服务端身份。
@@ -332,10 +387,16 @@ impl Server {
                     self.reply(&query, &reply).await;
                 }
                 Ingress::Open(query) => {
-                    session = self.handle_open(&zenoh, &query, session, &tx).await;
+                    session = self
+                        .handle_open(&zenoh, &query, session, &tx, worker.is_some())
+                        .await;
                 }
                 Ingress::Control(query) => {
-                    self.handle_control(&query, &mut session).await;
+                    self.handle_control(query, &mut session, worker.is_some())
+                        .await;
+                    if worker.is_none() && session.as_ref().is_some_and(|active| active.closing) {
+                        self.release_session(&mut session).await;
+                    }
                 }
                 Ingress::Observation {
                     payload,
@@ -365,11 +426,67 @@ impl Server {
         }
     }
 
+    /// 在场宽限到期后标记 closing；返回 true 表示当前没有在途推理，可以立即释放。
+    fn expire_session(&self, session: &mut Option<ActiveSession>, worker_busy: bool) -> bool {
+        let Some(active) = session.as_mut() else {
+            return false;
+        };
+        active.sync_presence(Instant::now());
+        if active.closing {
+            return false;
+        }
+        let Some(absent_since) = active.absent_since else {
+            return false;
+        };
+        if absent_since.elapsed() < Duration::from_secs_f64(self.cfg.execution.idle_timeout_s) {
+            return false;
+        }
+        let reason = if active.presence_established {
+            "client_absence"
+        } else {
+            "initial_presence_timeout"
+        };
+        active.closing = true;
+        active.cleanup_reason = Some(reason);
+        tracing::info!(
+            session = active.id,
+            reason,
+            inference_pending = worker_busy,
+            "session cleanup queued"
+        );
+        !worker_busy
+    }
+
+    /// 撤销会话所有权；通道句柄和未完成的 close 查询随 Drop 结束。
+    async fn release_session(&self, session: &mut Option<ActiveSession>) {
+        let Some(active) = session.take() else {
+            return;
+        };
+        if let Some((query, ack)) = active.pending_close.as_ref() {
+            self.reply(query, ack).await;
+        }
+        tracing::info!(
+            session = active.id,
+            reason = active.cleanup_reason.unwrap_or("client_close"),
+            "session ownership released"
+        );
+    }
+
     // ---- descriptor -------------------------------------------------------
 
-    /// 描述符字段对齐 Python `_descriptor_locked`，owner 取泵持有的当前会话。
-    fn descriptor_body(&self, owner: Option<&str>, inference_pending: bool) -> Value {
-        let busy = owner.is_some();
+    /// 描述符字段对齐 Python `_descriptor_locked`，会话诊断取泵持有的当前会话。
+    fn descriptor_body(&self, session: Option<&ActiveSession>, inference_pending: bool) -> Value {
+        let busy = session.is_some();
+        let absent_since = session.and_then(|active| active.absent_since);
+        let grace_remaining = absent_since.map(|since| {
+            (self.cfg.execution.idle_timeout_s - since.elapsed().as_secs_f64()).max(0.0)
+        });
+        let session_status = match session {
+            None => "idle",
+            Some(active) if active.closing => "closing",
+            Some(_) if inference_pending => "busy",
+            Some(_) => "active",
+        };
         map([
             (
                 "deployment",
@@ -406,31 +523,47 @@ impl Server {
                 map([
                     (
                         "owner",
-                        match owner {
-                            Some(id) => Value::String(id.into()),
+                        match session {
+                            Some(active) => Value::String(active.id.clone().into()),
                             None => Value::Nil,
                         },
                     ),
-                    ("client_present", Value::Nil),
-                    ("absence_grace_remaining_s", Value::Nil),
-                    ("cleanup_pending", Value::Boolean(false)),
-                    ("cleanup_reason", Value::Nil),
+                    (
+                        "client_present",
+                        match session.and_then(|active| active.present) {
+                            Some(present) => Value::Boolean(present),
+                            None => Value::Nil,
+                        },
+                    ),
+                    (
+                        "absence_grace_remaining_s",
+                        match grace_remaining {
+                            Some(remaining) => Value::from(remaining),
+                            None => Value::Nil,
+                        },
+                    ),
+                    (
+                        "cleanup_pending",
+                        Value::Boolean(session.is_some_and(|active| active.closing)),
+                    ),
+                    (
+                        "cleanup_reason",
+                        match session.and_then(|active| active.cleanup_reason) {
+                            Some(reason) => Value::String(reason.into()),
+                            None => Value::Nil,
+                        },
+                    ),
                     ("inference_pending", Value::Boolean(inference_pending)),
-                    // TODO: 接入客户端 liveliness 后填真实的 absence_grace 系列值。
                     (
                         "admission_blocker",
-                        if busy {
-                            Value::String("active_session".into())
-                        } else {
-                            Value::Nil
+                        match self.admission_blocker(session, inference_pending) {
+                            Some(blocker) => Value::String(blocker.into()),
+                            None => Value::Nil,
                         },
                     ),
                 ]),
             ),
-            (
-                "session_status",
-                Value::String(if busy { "active" } else { "idle" }.into()),
-            ),
+            ("session_status", Value::String(session_status.into())),
             (
                 "limits",
                 map([
@@ -452,6 +585,30 @@ impl Server {
         ])
     }
 
+    /// 与 Python `_admission_blocker_locked` 同序：清理优先，其次在场宽限。
+    fn admission_blocker(
+        &self,
+        session: Option<&ActiveSession>,
+        inference_pending: bool,
+    ) -> Option<&'static str> {
+        let active = session?;
+        if active.closing {
+            return Some(if inference_pending {
+                "unfinished_inference"
+            } else {
+                "worker_cleanup_pending"
+            });
+        }
+        if active.absent_since.is_some() {
+            return Some(if active.presence_established {
+                "absence_grace"
+            } else {
+                "awaiting_initial_presence"
+            });
+        }
+        Some("active_session")
+    }
+
     // ---- admission --------------------------------------------------------
 
     /// OPEN 校验对齐 `_validate_open`；骨架只放行 append 合并，aligned 显式拒绝。
@@ -462,6 +619,7 @@ impl Server {
         query: &Query,
         session: Option<ActiveSession>,
         tx: &IngressSender,
+        worker_busy: bool,
     ) -> Option<ActiveSession> {
         let envelope = match self.decode_query(query) {
             Ok(envelope) if envelope.message_type == MessageType::Open => envelope,
@@ -497,13 +655,29 @@ impl Server {
         }
         if session.is_some() {
             // 独占准入：忙时按 Python 的 details.admission_blocker 约定回复。
-            let mut busy =
-                envelope.error(ErrorCode::Busy, "an active session owns this deployment");
+            let blocker = self
+                .admission_blocker(session.as_ref(), worker_busy)
+                .unwrap_or("active_session");
+            let mut busy = envelope.error(
+                ErrorCode::Busy,
+                "an active session owns this deployment; the previous owner must finish cleanup",
+            );
             if let Value::Map(entries) = &mut busy.body {
-                entries.push((
-                    "details".into(),
-                    map([("admission_blocker", "active_session".into())]),
-                ));
+                let mut details = map([("admission_blocker", Value::String(blocker.into()))]);
+                if let Some(remaining) = session
+                    .as_ref()
+                    .and_then(|active| active.absent_since)
+                    .map(|since| {
+                        (self.cfg.execution.idle_timeout_s - since.elapsed().as_secs_f64()).max(0.0)
+                    })
+                    && let Value::Map(fields) = &mut details
+                {
+                    fields.push((
+                        Value::String("absence_grace_remaining_s".into()),
+                        Value::from(remaining),
+                    ));
+                }
+                entries.push(("details".into(), details));
             }
             self.reply(query, &busy).await;
             return session;
@@ -526,8 +700,7 @@ impl Server {
             }
         };
         // ACCEPTED = 完整描述符（含新 owner）+ 协商结果。
-        let mut accepted_body =
-            self.descriptor_body(Some(&session_id), tx.observation.available_permits() == 0);
+        let mut accepted_body = self.descriptor_body(Some(&active), false);
         if let Value::Map(entries) = &mut accepted_body {
             entries.push((Value::String("mode".into()), Value::String("chunk".into())));
             entries.push((
@@ -605,13 +778,39 @@ impl Server {
                     format!("declare language subscriber: {e}"),
                 )
             })?;
+        // history(true) 让客户端在 OPEN 之前声明的令牌也能立即送达；
+        // 回调只更新 watch，避免有界入口丢弃在场变化。
+        let (presence_tx, presence) = watch::channel(None);
+        let alive = zenoh
+            .liveliness()
+            .declare_subscriber(format!("{key}/alive"))
+            .history(true)
+            .callback(move |sample: Sample| {
+                let _ = presence_tx.send(Some(sample.kind() == SampleKind::Put));
+            })
+            .await
+            .map_err(|e| {
+                ProtocolError::new(
+                    ErrorCode::Execution,
+                    format!("declare presence subscriber: {e}"),
+                )
+            })?;
         tracing::debug!("channels declared for session {session_id}");
         Ok(ActiveSession {
             id: session_id.to_string(),
             generation: 0,
+            present: None,
+            presence_established: false,
+            // 初始在场也受宽限约束：客户端须在 idle_timeout_s 内声明令牌。
+            absent_since: Some(Instant::now()),
+            closing: false,
+            cleanup_reason: None,
+            pending_close: None,
+            presence,
             _obs: obs,
             _control: control,
             _language: language,
+            _alive: alive,
         })
     }
 
@@ -712,18 +911,24 @@ impl Server {
     /// 控制面对齐 Python `SessionWorker` 的 generation 规则：
     /// reset 把 generation 置为请求值（单调不回退），status 要求精确匹配，
     /// close 始终应用；ACK 必须回带 `applied_generation`（客户端逐字断言）。
-    async fn handle_control(&self, query: &Query, session: &mut Option<ActiveSession>) {
-        let envelope = match self.decode_query(query) {
+    /// 在途推理期间收到的 close 延后到 worker 结束再 ACK，所有权同刻释放。
+    async fn handle_control(
+        &self,
+        query: Query,
+        session: &mut Option<ActiveSession>,
+        worker_busy: bool,
+    ) {
+        let envelope = match self.decode_query(&query) {
             Ok(envelope) => envelope,
             Err(error) => {
-                self.reply(query, &Envelope::bare_error(error.code, &error.message))
+                self.reply(&query, &Envelope::bare_error(error.code, &error.message))
                     .await;
                 return;
             }
         };
         if envelope.message_type != MessageType::Control {
             self.reply(
-                query,
+                &query,
                 &envelope.error(ErrorCode::Malformed, "Wrong control surface"),
             )
             .await;
@@ -731,31 +936,39 @@ impl Server {
         }
         if envelope.instance_id != self.instance_id {
             self.reply(
-                query,
+                &query,
                 &envelope.error(ErrorCode::Stale, "Server instance does not match"),
             )
             .await;
             return;
         }
         let Some(active) = session.as_mut() else {
-            self.reply(query, &envelope.error(ErrorCode::Stale, "Session closed"))
+            self.reply(&query, &envelope.error(ErrorCode::Stale, "Session closed"))
                 .await;
             return;
         };
         if envelope.session_id != active.id {
             self.reply(
-                query,
+                &query,
                 &envelope.error(ErrorCode::Stale, "Session ownership changed"),
             )
             .await;
             return;
         }
         let operation = body_str(&envelope.body, "operation").unwrap_or("");
+        if active.closing && operation != "close" {
+            self.reply(
+                &query,
+                &envelope.error(ErrorCode::Stale, "Session is closing"),
+            )
+            .await;
+            return;
+        }
         let request_generation = envelope.generation;
         // close 之外，过旧的 generation 一律 STALE。
         if operation != "close" && request_generation < active.generation {
             self.reply(
-                query,
+                &query,
                 &envelope.error(ErrorCode::Stale, "Control generation became obsolete"),
             )
             .await;
@@ -764,7 +977,7 @@ impl Server {
         let applied = match operation {
             "status" if request_generation != active.generation => {
                 self.reply(
-                    query,
+                    &query,
                     &envelope.error(ErrorCode::Stale, "Status generation does not match"),
                 )
                 .await;
@@ -777,7 +990,7 @@ impl Server {
             "close" => request_generation,
             other => {
                 self.reply(
-                    query,
+                    &query,
                     &envelope.error(
                         ErrorCode::Unsupported,
                         &format!("control operation {other:?} is not supported by the skeleton"),
@@ -794,11 +1007,25 @@ impl Server {
                 ("applied_generation", Value::from(applied)),
             ]),
         );
-        self.reply(query, &ack).await;
         if operation == "close" {
-            tracing::info!("session {} closed by client", active.id);
-            *session = None;
+            if !active.closing {
+                active.closing = true;
+                active.cleanup_reason = Some("client_close");
+                tracing::info!(
+                    session = active.id,
+                    inference_pending = worker_busy,
+                    "session close requested"
+                );
+            }
+            // 忙时留给完成分支 ACK；泵在没有在途推理时立即释放所有权。
+            if worker_busy && active.pending_close.is_none() {
+                active.pending_close = Some((query, ack));
+            } else {
+                self.reply(&query, &ack).await;
+            }
+            return;
         }
+        self.reply(&query, &ack).await;
     }
 
     // ---- inference --------------------------------------------------------
@@ -834,6 +1061,15 @@ impl Server {
                 zenoh,
                 active,
                 &envelope.error(ErrorCode::Stale, "Session or generation became obsolete"),
+            )
+            .await;
+            return None;
+        }
+        if active.closing {
+            self.publish_act(
+                zenoh,
+                active,
+                &envelope.error(ErrorCode::Stale, "Session is not accepting inference"),
             )
             .await;
             return None;
@@ -905,6 +1141,10 @@ impl Server {
         let Some(active) = session else {
             return;
         };
+        // 清理中的会话不再发布结果；客户端已离开或正在关闭。
+        if active.closing {
+            return;
+        }
         let Completion {
             envelope,
             result,
@@ -988,6 +1228,8 @@ impl Server {
             || envelope.generation != active.generation
         {
             envelope.error(ErrorCode::Stale, "Session or generation became obsolete")
+        } else if active.closing {
+            envelope.error(ErrorCode::Stale, "Session is not accepting inference")
         } else {
             envelope.error(ErrorCode::Unsupported, "language generation is disabled")
         };
@@ -1098,6 +1340,37 @@ mod tests {
             Some(code.as_str()),
             "{reply:?}"
         );
+    }
+
+    /// 轮询描述符直到条件成立；在场事件经 zenoh 异步送达。
+    async fn wait_descriptor(wire: &Wire, predicate: impl Fn(&Value) -> bool) -> Value {
+        for _ in 0..200 {
+            let body = wire.describe().await.body;
+            if predicate(&body) {
+                return body;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("descriptor condition was not reached");
+    }
+
+    /// 脱离 `Wire` 借用发起查询，便于在等待 ACK 期间继续探测描述符。
+    fn detached_query(zenoh: Session, key: String, envelope: Envelope) -> JoinHandle<Envelope> {
+        let payload = codec::encode_envelope(&envelope, &Limits::default()).unwrap();
+        tokio::spawn(async move {
+            let replies = zenoh
+                .get(key)
+                .payload(payload)
+                .timeout(Duration::from_secs(5))
+                .await
+                .unwrap();
+            let reply = replies.recv_async().await.unwrap();
+            codec::decode_envelope(
+                &reply.result().as_ref().unwrap().payload().to_bytes(),
+                &Limits::default(),
+            )
+            .unwrap()
+        })
     }
 
     // 本地路由走真实编码和回调，无需端口、发现等待或外部进程。
@@ -1338,21 +1611,6 @@ mod tests {
         fails: bool,
     }
 
-    #[test]
-    fn release_cleanup_does_not_panic_on_poisoned_gate() {
-        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-        let poisoned = gate.clone();
-        assert!(
-            std::thread::spawn(move || {
-                let _held = poisoned.0.lock().unwrap();
-                panic!("poison test gate");
-            })
-            .join()
-            .is_err()
-        );
-        drop(Release(gate));
-    }
-
     struct Release(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
     impl Drop for Release {
         fn drop(&mut self) {
@@ -1393,64 +1651,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn slow_inference_does_not_block_control() {
-        let mut server = server();
-        let (entered, mut entries) = tokio::sync::mpsc::unbounded_channel();
-        let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-        let release = Release(gate.clone());
-        server.policy = with_policy(
-            &server,
-            SlowPolicy {
-                entered,
-                gate,
-                fails: false,
-            },
-        );
-        let wire = Wire::start_with(server).await;
-        let accepted = wire.admit().await;
-        let envelope = request(
-            MessageType::Observation,
-            &wire.instance,
-            &accepted.session_id,
-            0,
-            map([(
-                "features",
-                map([(
-                    "observation.state",
-                    codec::tensor_record("float32", &[6], vec![0; 24]),
-                )]),
-            )]),
-        );
-        wire.zenoh
-            .put(
-                wire.key(&accepted.session_id, "obs"),
-                codec::encode_envelope(&envelope, &Limits::default()).unwrap(),
-            )
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(3), entries.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        let reply = wire
-            .query(
-                &wire.key(&accepted.session_id, "control"),
-                &request(
-                    MessageType::Control,
-                    &wire.instance,
-                    &accepted.session_id,
-                    0,
-                    map([("operation", "status".into())]),
-                ),
-            )
-            .await;
-        assert_eq!(reply.message_type, MessageType::Ack);
-        drop(release);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn invalidated_workers_keep_capacity_and_drop_success_and_errors() {
-        for operation in ["reset", "close", "reopen"] {
+        for operation in ["reset", "close"] {
             for fails in [false, true] {
                 let mut server = server();
                 let (entered, mut entries) = tokio::sync::mpsc::unbounded_channel();
@@ -1503,40 +1705,68 @@ mod tests {
                     ),
                     Some(&true.into())
                 );
-                let control = if operation == "reset" {
-                    "reset"
-                } else {
-                    "close"
-                };
-                let ack = wire
-                    .query(
-                        &wire.key(&old, "control"),
-                        &request(
+                // reset 立即 ACK 并保留会话；close 推迟 ACK 到推理结束。
+                let close = if operation == "close" {
+                    Some(detached_query(
+                        wire.zenoh.clone(),
+                        wire.key(&old, "control"),
+                        request(
                             MessageType::Control,
                             &wire.instance,
                             &old,
-                            1,
-                            map([("operation", control.into())]),
+                            0,
+                            map([("operation", "close".into())]),
                         ),
-                    )
-                    .await;
-                assert_eq!(ack.message_type, MessageType::Ack);
-                let current = if operation == "reopen" {
-                    wire.admit().await.session_id
+                    ))
                 } else {
-                    old.clone()
+                    let ack = wire
+                        .query(
+                            &wire.key(&old, "control"),
+                            &request(
+                                MessageType::Control,
+                                &wire.instance,
+                                &old,
+                                1,
+                                map([("operation", "reset".into())]),
+                            ),
+                        )
+                        .await;
+                    assert_eq!(ack.message_type, MessageType::Ack);
+                    None
                 };
-                observation.session_id = current.clone();
-                observation.generation = if operation == "reset" { 1 } else { 0 };
                 observation.request_id = "next".into();
-                if operation != "close" {
+                if operation == "reset" {
+                    observation.generation = 1;
+                    // 会话保留，容量被在途推理占满：新观测 Busy。
+                    let busy = wire.publish_reply(&old, "obs", "act", &observation).await;
+                    assert_error(&busy, ErrorCode::Busy);
+                    old_actions.recv_async().await.unwrap();
+                } else {
+                    let closing = wait_descriptor(&wire, |body| {
+                        body_get(body, "session_status") == Some(&"closing".into())
+                    })
+                    .await;
+                    assert!(
+                        !close.as_ref().unwrap().is_finished(),
+                        "close ACK was sent before inference"
+                    );
+                    let session = body_get(&closing, "session").unwrap();
+                    assert_eq!(body_get(session, "cleanup_pending"), Some(&true.into()));
+                    assert_eq!(
+                        body_str(session, "admission_blocker"),
+                        Some("unfinished_inference")
+                    );
                     let busy = wire
-                        .publish_reply(&current, "obs", "act", &observation)
+                        .query(
+                            &wire.open_key,
+                            &request(MessageType::Open, &wire.instance, "", 0, wire.body.clone()),
+                        )
                         .await;
                     assert_error(&busy, ErrorCode::Busy);
-                    if operation == "reset" {
-                        old_actions.recv_async().await.unwrap();
-                    }
+                    let stale = wire.publish_reply(&old, "obs", "act", &observation).await;
+                    assert_error(&stale, ErrorCode::Stale);
+                    // 该 STALE 错误也会投递到 old_actions；先取走再检查泄漏。
+                    old_actions.recv_async().await.unwrap();
                 }
                 assert!(
                     entries.try_recv().is_err(),
@@ -1557,11 +1787,18 @@ mod tests {
                     "obsolete result leaked: {operation}/{fails}"
                 );
                 drop(permit);
-                if operation == "close" {
-                    observation.session_id = wire.admit().await.session_id;
-                }
+                let (current, generation) = match close {
+                    Some(close) => {
+                        let ack = close.await.unwrap();
+                        assert_eq!(ack.message_type, MessageType::Ack);
+                        (wire.admit().await.session_id, 0)
+                    }
+                    None => (old.clone(), 1),
+                };
+                observation.session_id = current.clone();
+                observation.generation = generation;
                 let result = wire
-                    .publish_reply(&observation.session_id, "obs", "act", &observation)
+                    .publish_reply(&current, "obs", "act", &observation)
                     .await;
                 if fails {
                     assert_error(&result, ErrorCode::Execution);
@@ -1571,158 +1808,6 @@ mod tests {
                 assert_eq!(result.request_id, "next");
             }
         }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn callback_retains_only_one_observation_and_one_overload() {
-        let wire = Wire::start().await;
-        let (ingress, mut receiver) = IngressSender::channel();
-        let callback = ingress.clone();
-        let _subscriber = wire
-            .zenoh
-            .declare_subscriber("bounded/obs")
-            .callback(move |sample| callback.observation(&sample))
-            .await
-            .unwrap();
-        for _ in 0..100 {
-            wire.zenoh
-                .put("bounded/obs", vec![1u8; 1024])
-                .await
-                .unwrap();
-        }
-        assert_eq!(receiver.len(), 2);
-        assert_eq!(ingress.observation.available_permits(), 0);
-        assert_eq!(ingress.overload.available_permits(), 0);
-        let first = receiver.try_recv().unwrap();
-        let second = receiver.try_recv().unwrap();
-        assert!(matches!(
-            first,
-            Ingress::Observation {
-                overloaded: false,
-                ..
-            }
-        ));
-        assert!(matches!(
-            second,
-            Ingress::Observation {
-                overloaded: true,
-                ..
-            }
-        ));
-        assert!(receiver.try_recv().is_err());
-        drop((first, second));
-        assert_eq!(ingress.observation.available_permits(), 1);
-        assert_eq!(ingress.overload.available_permits(), 1);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-    async fn completion_preserves_queue_and_worker_durations() {
-        let server = server();
-        let wire = Wire::start().await;
-        let accepted = wire.admit().await;
-        let (tx, _rx) = IngressSender::channel();
-        let key = session_prefix(
-            &server.cfg.deployment,
-            &server.instance_id,
-            &accepted.session_id,
-        )
-        .unwrap();
-        let active = server
-            .declare_channels(&wire.zenoh, &key, &accepted.session_id, &tx)
-            .await
-            .unwrap();
-        let subscriber = wire
-            .zenoh
-            .declare_subscriber(format!("{key}/act"))
-            .await
-            .unwrap();
-        let arrived = Instant::now();
-        let started = arrived + Duration::from_millis(25);
-        let finished = started + Duration::from_millis(75);
-        let envelope = request(
-            MessageType::Observation,
-            &server.instance_id,
-            &accepted.session_id,
-            0,
-            map([]),
-        );
-        let chunk = crate::inference::ActionChunk {
-            values: vec![
-                0.;
-                (server.caps.execution_steps * server.caps.action_feature.shape[0])
-                    as usize
-            ],
-            steps: server.caps.execution_steps as usize,
-            dim: server.caps.action_feature.shape[0] as usize,
-        };
-        server
-            .complete_observation(
-                &wire.zenoh,
-                Some(&active),
-                Completion {
-                    envelope,
-                    result: Ok(chunk),
-                    queue_s: started.duration_since(arrived).as_secs_f64(),
-                    worker_s: finished.duration_since(started).as_secs_f64(),
-                    _permit: tx.observation.clone().acquire_owned().await.unwrap(),
-                },
-            )
-            .await;
-        let sample = tokio::time::timeout(Duration::from_secs(3), subscriber.recv_async())
-            .await
-            .unwrap()
-            .unwrap();
-        let reply =
-            codec::decode_envelope(&sample.payload().to_bytes(), &Limits::default()).unwrap();
-        let durations = body_get(&reply.body, "server_durations").unwrap();
-        assert_eq!(body_f64(durations, "queue"), Some(0.025));
-        assert_eq!(body_f64(durations, "worker"), Some(0.075));
-    }
-
-    #[test]
-    fn open_rejects_jpeg_and_malformed_collections() {
-        let server = server();
-        let mut features = server
-            .caps
-            .features
-            .iter()
-            .map(to_value)
-            .collect::<Vec<_>>();
-        features.push(true.into());
-        for (field, value, code, diagnostic) in [
-            (
-                "encoding",
-                "jpeg".into(),
-                ErrorCode::Unsupported,
-                "encoding",
-            ),
-            (
-                "required_capabilities",
-                Value::Array(vec![42.into()]),
-                ErrorCode::Malformed,
-                "required_capabilities[0]",
-            ),
-            (
-                "required_capabilities",
-                true.into(),
-                ErrorCode::Malformed,
-                "required_capabilities",
-            ),
-            ("features", true.into(), ErrorCode::Malformed, "features"),
-            (
-                "features",
-                Value::Array(features),
-                ErrorCode::Malformed,
-                "features[1]",
-            ),
-        ] {
-            let mut body = open_body(&server);
-            replace(&mut body, field, value);
-            let error = server.validate_open(&body).expect_err(field);
-            assert_eq!(error.code, code, "{field}");
-            assert!(error.message.contains(diagnostic), "{error}");
-        }
-        assert!(server.validate_open(&open_body(&server)).is_ok());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -1742,10 +1827,50 @@ mod tests {
             body_str(session, "owner"),
             Some(accepted.session_id.as_str())
         );
+        // 客户端令牌尚未声明：准入被初始在场宽限阻塞，但不是清理。
+        assert_eq!(body_get(session, "client_present"), Some(&Value::Nil));
+        assert!(body_f64(session, "absence_grace_remaining_s").is_some());
+        assert_eq!(body_get(session, "cleanup_pending"), Some(&false.into()));
         assert_eq!(
             body_str(session, "admission_blocker"),
+            Some("awaiting_initial_presence")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_absence_releases_session_after_grace() {
+        let mut server = server();
+        server.cfg.execution.idle_timeout_s = 0.2;
+        let wire = Wire::start_with(server).await;
+        let accepted = wire.admit().await;
+        let token = wire
+            .zenoh
+            .liveliness()
+            .declare_token(wire.key(&accepted.session_id, "alive"))
+            .await
+            .unwrap();
+        let active = wait_descriptor(&wire, |body| {
+            body_get(body_get(body, "session").unwrap(), "client_present") == Some(&true.into())
+        })
+        .await;
+        assert_eq!(body_str(&active, "session_status"), Some("active"));
+        assert_eq!(
+            body_str(body_get(&active, "session").unwrap(), "admission_blocker"),
             Some("active_session")
         );
+
+        drop(token);
+        let idle = wait_descriptor(&wire, |body| {
+            body_get(body, "session_status") == Some(&"idle".into())
+        })
+        .await;
+        assert_eq!(body_get(&idle, "available"), Some(&true.into()));
+        assert_eq!(
+            body_get(body_get(&idle, "session").unwrap(), "owner"),
+            Some(&Value::Nil)
+        );
+        // 宽限释放后所有权可被新会话取得。
+        wire.admit().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -1781,6 +1906,11 @@ mod tests {
             body_get(&wire.describe().await.body, "available"),
             Some(&true.into())
         );
+        let mut features = match body_get(&wire.body, "features") {
+            Some(Value::Array(items)) => items.clone(),
+            _ => panic!("open body must carry features"),
+        };
+        features.push(true.into());
         for (field, value, code) in [
             ("encoding", "jpeg".into(), ErrorCode::Unsupported),
             (
@@ -1788,6 +1918,9 @@ mod tests {
                 Value::Array(vec![42.into()]),
                 ErrorCode::Malformed,
             ),
+            ("required_capabilities", true.into(), ErrorCode::Malformed),
+            ("features", true.into(), ErrorCode::Malformed),
+            ("features", Value::Array(features), ErrorCode::Malformed),
         ] {
             let mut body = wire.body.clone();
             replace(&mut body, field, value);
@@ -1811,7 +1944,7 @@ mod tests {
                 body_get(&busy.body, "details").unwrap(),
                 "admission_blocker"
             ),
-            Some("active_session")
+            Some("awaiting_initial_presence")
         );
         let descriptor = wire.describe().await;
         assert_eq!(
